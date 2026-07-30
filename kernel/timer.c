@@ -10,7 +10,8 @@ uint32_t tick = 0;
 
 void timer_handler() {
     tick++;
-    metrics.total_cycles += 10000; // Mock increment
+    metrics.total_cycles += 10000;
+    if (tick % 10 == 0) task_switch();
 }
 
 void timer_init(uint32_t frequency) {

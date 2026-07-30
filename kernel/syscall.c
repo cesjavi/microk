@@ -11,9 +11,20 @@
 #include "kheap.h"
 #include "net.h"
 #include "gpu.h"
+#include "vmm.h"
+#include "ipc.h"
 #include <string.h>
 
 extern struct kernel_metrics metrics;
+
+/* Validate a user pointer: non-null, no overflow, and every page has U/S=1. */
+static int uptr_ok(uint32_t ptr, uint32_t len) {
+    return ptr != 0 && vmm_user_ptr_ok(ptr, len);
+}
+/* Validate a user C-string pointer (check one page at minimum). */
+static int ustr_ok(uint32_t ptr) {
+    return ptr != 0 && vmm_user_ptr_ok(ptr, 1);
+}
 
 void syscall_init() {
 }
@@ -30,27 +41,29 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 1: // Print
             {
                 extern void kprint(const char *msg);
-                if (arg1) kprint((char *)arg1);
+                if (ustr_ok(arg1)) kprint((char *)arg1);
             }
             break;
         case 2: // Yield
             task_switch();
             break;
         case 3: // Get Metrics
-            if (arg1) *((struct kernel_metrics *)arg1) = metrics;
+            if (uptr_ok(arg1, sizeof(struct kernel_metrics)))
+                *((struct kernel_metrics *)arg1) = metrics;
             break;
         case 4: // Get Char
-            if (arg1) *((char *)arg1) = keyboard_get_char();
+            if (uptr_ok(arg1, 1)) *((char *)arg1) = keyboard_get_char();
             break;
         case 5: // LLM Query
-            if (arg1 && arg2) llm_inference((char *)arg1, (char *)arg2);
+            if (ustr_ok(arg1) && uptr_ok(arg2, 128))
+                llm_inference((char *)arg1, (char *)arg2);
             break;
         case 6: // Beep
             speaker_beep(arg1, arg2);
             break;
         case 7: // Read File (arg1=name, arg2=buffer)
             {
-                if (!arg1 || !arg2) break;
+                if (!ustr_ok(arg1) || !uptr_ok(arg2, 256)) break;
                 vfs_node_t *node = initrd_find_node((char *)arg1);
                 if (node) {
                     uint32_t size = node->length;
@@ -82,14 +95,14 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             {
                 extern void fat32_ls();
                 extern void fat32_ls_path(const char *path);
-                if (arg1) fat32_ls_path((char *)arg1);
-                else fat32_ls();
+                if (arg1 && ustr_ok(arg1)) fat32_ls_path((char *)arg1);
+                else if (!arg1) fat32_ls();
             }
             break;
         case 14: // FAT32 CAT
             {
                 extern void fat32_cat(const char *filename);
-                if (arg1) fat32_cat((char *)arg1);
+                if (ustr_ok(arg1)) fat32_cat((char *)arg1);
             }
             break;
         case 15: // EXT LS
@@ -101,7 +114,7 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 16: // EXT CAT
             {
                 extern void extfs_cat(const char *filename);
-                if (arg1) extfs_cat((char *)arg1);
+                if (ustr_ok(arg1)) extfs_cat((char *)arg1);
             }
             break;
         case 17: // LLM Load Model
@@ -109,7 +122,7 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
                 extern void llm_load_model_module(uint32_t start, uint32_t end, const char *name);
                 extern int llm_model_supported();
                 // arg1 = addr, arg2 = size, arg3 = name_ptr
-                if (arg1 && arg2) {
+                if (uptr_ok(arg1, arg2) && arg1 + arg2 >= arg1 && (!arg3 || ustr_ok(arg3))) {
                     llm_load_model_module(arg1, arg1 + arg2, (char *)arg3);
                     retval = llm_model_supported();
                 }
@@ -118,7 +131,7 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 18: // Get LLM Status String
             {
                 extern const char* llm_status_string();
-                if (arg1) {
+                if (uptr_ok(arg1, 256)) {
                     strncpy((char *)arg1, llm_status_string(), 255);
                     ((char *)arg1)[255] = '\0';
                 }
@@ -127,7 +140,7 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 19: // Get LLM Info String
             {
                 extern const char* llm_info_string();
-                if (arg1) {
+                if (uptr_ok(arg1, 256)) {
                     strncpy((char *)arg1, llm_info_string(), 255);
                     ((char *)arg1)[255] = '\0';
                 }
@@ -136,13 +149,15 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 21: // FAT32 Create File
             {
                 extern int fat32_create_file(const char *filename);
-                if (arg1 && arg2) *((int *)arg2) = fat32_create_file((char *)arg1);
+                if (ustr_ok(arg1) && uptr_ok(arg2, sizeof(int)))
+                    *((int *)arg2) = fat32_create_file((char *)arg1);
             }
             break;
         case 22: // FAT32 Write File
             {
                 extern int fat32_write_file(const char *filename, uint8_t *buffer, uint32_t size);
-                if (arg1 && arg2) fat32_write_file((char *)arg1, (uint8_t *)arg2, arg3);
+                if (ustr_ok(arg1) && uptr_ok(arg2, arg3 ? arg3 : 1))
+                    fat32_write_file((char *)arg1, (uint8_t *)arg2, arg3);
             }
             break;
         case 23: // FAT32 Delete File
@@ -158,28 +173,33 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             }
             break;
         case 25: // Net Status String
-            if (arg1) {
+            if (uptr_ok(arg1, 256)) {
                 strncpy((char *)arg1, net_status_string(), 255);
                 ((char *)arg1)[255] = '\0';
             }
             break;
         case 26: // Net Config DHCP
-            if (arg1) *((int *)arg1) = net_config_dhcp();
+            if (uptr_ok(arg1, sizeof(int))) *((int *)arg1) = net_config_dhcp();
             break;
         case 27: // Net Config Static
-            if (arg1 && arg2) {
+            if (uptr_ok(arg1, sizeof(char *) * 3) && uptr_ok(arg2, sizeof(int))) {
                 char **args = (char **)arg1;
-                *((int *)arg2) = net_config_static(args[0], args[1], args[2]);
+                if (ustr_ok((uint32_t)(uintptr_t)args[0]) &&
+                    ustr_ok((uint32_t)(uintptr_t)args[1]) &&
+                    ustr_ok((uint32_t)(uintptr_t)args[2])) {
+                    *((int *)arg2) = net_config_static(args[0], args[1], args[2]);
+                }
             }
             break;
         case 28: // Memory Region Count
-            if (arg1) *((uint32_t *)arg1) = pmm_memory_region_count();
+            if (uptr_ok(arg1, sizeof(uint32_t))) *((uint32_t *)arg1) = pmm_memory_region_count();
             break;
         case 29: // Memory Region Get
-            if (arg2 && arg3) *((int *)arg3) = pmm_get_memory_region(arg1, (pmm_memory_region_t *)arg2);
+            if (uptr_ok(arg2, sizeof(pmm_memory_region_t)) && uptr_ok(arg3, sizeof(int)))
+                *((int *)arg3) = pmm_get_memory_region(arg1, (pmm_memory_region_t *)arg2);
             break;
         case 30: // GPU Status String
-            if (arg1) {
+            if (uptr_ok(arg1, 768)) {
                 strncpy((char *)arg1, gpu_status_string(), 767);
                 ((char *)arg1)[767] = '\0';
             }
@@ -202,7 +222,10 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 33: // FAT32 Get Entry by Index
             {
                 extern int fat32_get_entry_by_index(const char *path, uint32_t index, char *out_name, int *out_is_dir);
-                retval = fat32_get_entry_by_index((char *)arg1, arg2, (char *)arg3, (int *)0);
+                int is_dir = 0;
+                if (arg1 && arg3) {
+                    retval = fat32_get_entry_by_index((char *)arg1, arg2, (char *)arg3, &is_dir);
+                }
             }
             break;
         case 34: // PMM Allocate Contiguous Region
@@ -211,13 +234,13 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 35: // LLM Load Model File
             {
                 extern int llm_load_model_file(const char *name);
-                if (arg1) retval = llm_load_model_file((char *)arg1);
+                if (ustr_ok(arg1)) retval = llm_load_model_file((char *)arg1);
             }
             break;
         case 36: // FAT32 Is Directory
             {
                 extern int fat32_path_is_dir(const char *path);
-                retval = fat32_path_is_dir((char *)arg1);
+                if (ustr_ok(arg1)) retval = fat32_path_is_dir((char *)arg1);
             }
             break;
         case 37: // LLM Trace Set
@@ -235,7 +258,7 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 39: // ARP Status String
             {
                 extern const char* arp_status_string(void);
-                if (arg1) {
+                if (uptr_ok(arg1, 512)) {
                     strncpy((char *)arg1, arp_status_string(), 511);
                     ((char *)arg1)[511] = '\0';
                 }
@@ -291,7 +314,7 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             retval = (uint32_t)net_llm_service_set_enabled((int)arg1);
             break;
         case 42: // LLM Network Service Status String
-            if (arg1) {
+            if (uptr_ok(arg1, 256)) {
                 strncpy((char *)arg1, net_llm_service_status_string(), 255);
                 ((char *)arg1)[255] = '\0';
             }
@@ -301,6 +324,76 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             break;
         case 44: // LLM Network Service Port
             retval = (uint32_t)net_llm_service_set_port((uint16_t)arg1);
+            break;
+        case 45: // ICMP ping — returns RTT ms, 0=timeout, <0=error
+            if (ustr_ok(arg1)) {
+                retval = (uint32_t)net_ping((const char *)arg1);
+            }
+            break;
+        case 46: // DNS resolve — arg1=hostname, arg2=uint8_t[4] out_ip; returns 1 on success
+            if (ustr_ok(arg1) && uptr_ok(arg2, 4)) {
+                retval = (uint32_t)net_dns_resolve((const char *)arg1, (uint8_t *)arg2);
+            }
+            break;
+        case 47: // LLM service set token — arg1=token string ("off" clears)
+            if (ustr_ok(arg1)) retval = (uint32_t)net_llm_service_set_token((const char *)arg1);
+            break;
+        case 48: // RSH set enabled — arg1=0 or 1
+            retval = (uint32_t)net_rsh_set_enabled((int)arg1);
+            break;
+        case 49: // RSH set port — arg1=port
+            retval = (uint32_t)net_rsh_set_port((uint16_t)arg1);
+            break;
+        case 50: // RSH set token — arg1=token string ("off" clears)
+            if (ustr_ok(arg1)) retval = (uint32_t)net_rsh_set_token((const char *)arg1);
+            break;
+        case 51: // RSH status string — arg1=buf (192 bytes)
+            if (uptr_ok(arg1, 192)) {
+                strncpy((char *)arg1, net_rsh_status_string(), 191);
+                ((char *)arg1)[191] = '\0';
+            }
+            break;
+        case 52: // GGUF selftest — 1=pass, -1=fail, 0=skip
+            retval = (uint32_t)llm_gguf_selftest();
+            break;
+        case 53: // Net Config Save — persist current net_config to /net.cfg
+            retval = (uint32_t)net_save_config();
+            break;
+        case 54: // IPC SHM Create — arg1=key, arg2=size, arg3=out_id ptr
+            if (uptr_ok(arg3, sizeof(uint32_t)))
+                retval = (uint32_t)ipc_shm_create(arg1, arg2, (uint32_t *)arg3);
+            break;
+        case 55: // IPC SHM Attach — arg1=id, arg2=out_addr ptr, arg3=out_size ptr
+            if (uptr_ok(arg2, sizeof(uint32_t)) && (!arg3 || uptr_ok(arg3, sizeof(uint32_t))))
+                retval = (uint32_t)ipc_shm_attach(arg1, (uint32_t *)arg2, arg3 ? (uint32_t *)arg3 : 0);
+            break;
+        case 56: // IPC SHM Detach — arg1=id
+            retval = (uint32_t)ipc_shm_detach(arg1);
+            break;
+        case 57: // IPC SHM Destroy — arg1=id
+            retval = (uint32_t)ipc_shm_destroy(arg1);
+            break;
+        case 58: // IPC SHM Selftest — 1=pass, 0=fail
+            retval = (uint32_t)ipc_shm_selftest();
+            break;
+        case 59: // LLM Dump Logits — arg1=prompt str, arg2=response buf (128 bytes)
+            if (ustr_ok(arg1) && uptr_ok(arg2, 128))
+                llm_dump_logits((char *)arg1, (char *)arg2);
+            break;
+        case 60: // High-memory buffer (hbuf) selftest — 1=pass, -1=fail, 0=skip
+            {
+                extern int hbuf_selftest(void);
+                retval = (uint32_t)hbuf_selftest();
+            }
+            break;
+        case 61: // USB (UHCI) Status String
+            {
+                extern const char *uhci_status_string(void);
+                if (uptr_ok(arg1, 256)) {
+                    strncpy((char *)arg1, uhci_status_string(), 255);
+                    ((char *)arg1)[255] = '\0';
+                }
+            }
             break;
         default:
             break;
