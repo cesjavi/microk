@@ -66,6 +66,10 @@ typedef struct {
     uint32_t fat_start_lba;
     uint32_t data_start_lba;
     uint32_t root_cluster;
+    /* Upper bound on the number of distinct clusters the FAT can address,
+     * used to cap chain-traversal loops so a corrupted/cyclic FAT chain
+     * cannot hang the kernel. */
+    uint32_t max_clusters;
 } fat32_mount_t;
 
 typedef struct {
@@ -83,6 +87,13 @@ static int fat32_probe(block_device_t *device) {
     if (bpb.signature != 0xAA55) return 0;
     if (bpb.sectors_per_fat_16 != 0) return 0; // Not FAT32
     if (bpb.boot_signature != 0x28 && bpb.boot_signature != 0x29) return 0;
+    /* Reject geometries that would cause a divide-by-zero or make cluster
+     * arithmetic meaningless further down the driver. */
+    if (bpb.bytes_per_sector != 512) return 0;
+    if (bpb.sectors_per_cluster == 0) return 0;
+    if (bpb.sectors_per_fat_32 == 0) return 0;
+    if (bpb.fat_count == 0) return 0;
+    if (bpb.root_cluster < 2) return 0;
     return 1;
 }
 
@@ -101,7 +112,11 @@ static uint32_t fat32_get_next_cluster(fat32_mount_t *mount, uint32_t cluster) {
     uint32_t fat_sector = mount->fat_start_lba + (fat_offset / 512);
     uint32_t ent_offset = fat_offset % 512;
     uint8_t sector[512];
-    vfs_read_device(mount->device, fat_sector * 512, 512, sector);
+    /* On I/O failure, treat the chain as ended (EOC) rather than feeding
+     * uninitialized stack memory back into cluster-chain traversal. */
+    if (vfs_read_device(mount->device, fat_sector * 512, 512, sector) < 0) {
+        return 0x0FFFFFFF;
+    }
     uint32_t next = *(uint32_t *)&sector[ent_offset] & 0x0FFFFFFF;
     return next;
 }
@@ -115,8 +130,10 @@ static void fat32_set_cluster(fat32_mount_t *mount, uint32_t cluster, uint32_t v
     uint32_t fat_sector = mount->fat_start_lba + (fat_offset / 512);
     uint32_t ent_offset = fat_offset % 512;
     uint8_t sector[512];
-    vfs_read_device(mount->device, fat_sector * 512, 512, sector);
-    
+    if (vfs_read_device(mount->device, fat_sector * 512, 512, sector) < 0) {
+        return;
+    }
+
     uint32_t current = *(uint32_t *)&sector[ent_offset];
     value = (value & 0x0FFFFFFF) | (current & 0xF0000000);
     *(uint32_t *)&sector[ent_offset] = value;
@@ -147,6 +164,8 @@ static uint32_t fat32_find_free_cluster(fat32_mount_t *mount) {
     return 0xFFFFFFFF;
 }
 
+static int fat32_valid_cluster(uint32_t cluster);
+
 /**
  * @brief Reads data from a FAT32 file node into a buffer.
  */
@@ -160,19 +179,20 @@ static uint32_t fat32_read(vfs_node_t *node, uint32_t offset, uint32_t size, uin
     uint32_t cluster_idx = offset / cluster_size;
     uint32_t offset_in_cluster = offset % cluster_size;
     
+    if (!fat32_valid_cluster(cluster)) return 0;
     for (uint32_t i = 0; i < cluster_idx; i++) {
         cluster = fat32_get_next_cluster(mount, cluster);
-        if (cluster >= 0x0FFFFFF8) return 0; // EOF
+        if (!fat32_valid_cluster(cluster)) return 0; // EOF
     }
-    
+
     uint32_t bytes_read = 0;
     uint8_t *temp = kmalloc(cluster_size);
     if (!temp) return 0;
 
-    while (bytes_read < size && cluster < 0x0FFFFFF8) {
+    while (bytes_read < size && fat32_valid_cluster(cluster)) {
         uint32_t lba = fat32_cluster_to_lba(mount, cluster);
-        vfs_read_device(mount->device, lba * 512, cluster_size, temp);
-        
+        if (vfs_read_device(mount->device, lba * 512, cluster_size, temp) < 0) break;
+
         uint32_t chunk = cluster_size - offset_in_cluster;
         if (chunk > size - bytes_read) chunk = size - bytes_read;
         
@@ -199,21 +219,22 @@ static uint32_t fat32_write(vfs_node_t *node, uint32_t offset, uint32_t size, ui
     uint32_t cluster_idx = offset / cluster_size;
     uint32_t offset_in_cluster = offset % cluster_size;
     
+    if (!fat32_valid_cluster(cluster)) return 0;
     for (uint32_t i = 0; i < cluster_idx; i++) {
         cluster = fat32_get_next_cluster(mount, cluster);
-        if (cluster >= 0x0FFFFFF8) return 0; // EOF (resizing not supported yet)
+        if (!fat32_valid_cluster(cluster)) return 0; // EOF (resizing not supported yet)
     }
-    
+
     uint32_t bytes_written = 0;
     uint8_t *temp = kmalloc(cluster_size);
     if (!temp) return 0;
 
-    while (bytes_written < size && cluster < 0x0FFFFFF8) {
+    while (bytes_written < size && fat32_valid_cluster(cluster)) {
         uint32_t lba = fat32_cluster_to_lba(mount, cluster);
-        
+
         // Read-modify-write for the cluster
-        vfs_read_device(mount->device, lba * 512, cluster_size, temp);
-        
+        if (vfs_read_device(mount->device, lba * 512, cluster_size, temp) < 0) break;
+
         uint32_t chunk = cluster_size - offset_in_cluster;
         if (chunk > size - bytes_written) chunk = size - bytes_written;
         
@@ -384,43 +405,111 @@ static uint32_t fat32_entry_cluster(const fat32_dir_entry_t *entry) {
     return ((uint32_t)entry->cluster_high << 16) | entry->cluster_low;
 }
 
-static void fat32_lfn_append_char(char *lfn, uint32_t pos, uint16_t value) {
-    if (pos >= 255) {
-        return;
-    }
-    if (value == 0x0000 || value == 0xFFFF) {
-        return;
-    }
-    lfn[pos] = (value < 128) ? (char)value : '?';
+#define FAT32_LFN_MAX_UNITS 260
+
+typedef struct {
+    uint16_t units[FAT32_LFN_MAX_UNITS]; /* assembled UCS-2 code units */
+    uint8_t checksum;
+    int active;
+    int valid; /* drops to 0 if a checksum mismatch is seen mid-sequence */
+} fat32_lfn_state_t;
+
+static void fat32_lfn_reset(fat32_lfn_state_t *st) {
+    memset(st->units, 0, sizeof(st->units));
+    st->checksum = 0;
+    st->active = 0;
+    st->valid = 0;
 }
 
-static void fat32_lfn_store_entry(const fat32_lfn_entry_t *entry, char *lfn) {
+/* Standard MS-DOS LFN checksum: rotate-right-1 then add, over the raw
+ * 11-byte 8.3 name. Every LFN fragment of one logical name carries this
+ * same value computed from its associated short entry; validating it
+ * catches orphaned/corrupted LFN fragments (e.g. left behind after a
+ * partial write or directory corruption) that would otherwise silently
+ * be displayed as if they belonged to the wrong file. */
+static uint8_t fat32_lfn_checksum(const char short_name[11]) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; i++) {
+        sum = (uint8_t)(((sum & 1) << 7) | ((sum & 0xFE) >> 1));
+        sum = (uint8_t)(sum + (uint8_t)short_name[i]);
+    }
+    return sum;
+}
+
+/* Feeds one LFN directory entry into the assembly state. LFN entries are
+ * stored in reverse order (highest fragment number, marked with the 0x40
+ * "last entry" bit, first), so seeing that bit starts a fresh sequence. */
+static void fat32_lfn_feed(fat32_lfn_state_t *st, const fat32_lfn_entry_t *entry) {
     uint32_t order = entry->order & 0x1F;
-    if (order == 0) {
+    uint16_t chars[13];
+    uint32_t pos;
+
+    if (order == 0 || order > 20) {
+        st->active = 0;
         return;
     }
 
-    uint32_t pos = (order - 1) * 13;
-    for (int i = 0; i < 5; i++) {
-        fat32_lfn_append_char(lfn, pos++, entry->name1[i]);
+    if (entry->order & 0x40) {
+        fat32_lfn_reset(st);
+        st->active = 1;
+        st->valid = 1;
+        st->checksum = entry->checksum;
+    } else if (!st->active) {
+        return;
+    } else if (entry->checksum != st->checksum) {
+        st->valid = 0;
     }
-    for (int i = 0; i < 6; i++) {
-        fat32_lfn_append_char(lfn, pos++, entry->name2[i]);
-    }
-    for (int i = 0; i < 2; i++) {
-        fat32_lfn_append_char(lfn, pos++, entry->name3[i]);
+
+    pos = (order - 1) * 13;
+    for (int i = 0; i < 5; i++) chars[i] = entry->name1[i];
+    for (int i = 0; i < 6; i++) chars[5 + i] = entry->name2[i];
+    for (int i = 0; i < 2; i++) chars[11 + i] = entry->name3[i];
+
+    for (int i = 0; i < 13 && pos + (uint32_t)i < FAT32_LFN_MAX_UNITS - 1; i++) {
+        uint16_t v = chars[i];
+        if (v == 0x0000 || v == 0xFFFF) continue;
+        st->units[pos + i] = v;
     }
 }
 
-static void fat32_entry_display_name(const fat32_dir_entry_t *entry, const char *lfn, int lfn_active, char *out, uint32_t out_size) {
+/* Returns 1 if st holds a complete LFN whose checksum matches short_name
+ * (the raw 11-byte 8.3 name of the entry it's paired with). */
+static int fat32_lfn_validate(const fat32_lfn_state_t *st, const char short_name[11]) {
+    if (!st->active || !st->valid) return 0;
+    return fat32_lfn_checksum(short_name) == st->checksum;
+}
+
+/* Encodes the assembled UCS-2 LFN as UTF-8. Covers the full Basic
+ * Multilingual Plane (codepoints up to 0xFFFF); surrogate pairs (for
+ * codepoints beyond the BMP) are vanishingly rare in real filenames and
+ * are emitted as their raw 3-byte UTF-8 surrogate encoding rather than
+ * combined, which is a known limitation, not a crash/corruption risk. */
+static void fat32_lfn_to_utf8(const uint16_t *units, char *out, uint32_t out_size) {
+    uint32_t opos = 0;
+    for (uint32_t i = 0; i < FAT32_LFN_MAX_UNITS && units[i] != 0 && opos + 4 < out_size; i++) {
+        uint16_t cp = units[i];
+        if (cp < 0x80) {
+            out[opos++] = (char)cp;
+        } else if (cp < 0x800) {
+            out[opos++] = (char)(0xC0 | (cp >> 6));
+            out[opos++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[opos++] = (char)(0xE0 | (cp >> 12));
+            out[opos++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[opos++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    out[opos] = '\0';
+}
+
+static void fat32_entry_display_name(const fat32_dir_entry_t *entry, fat32_lfn_state_t *lfn_state, char *out, uint32_t out_size) {
     if (!out || out_size == 0) {
         return;
     }
 
-    if (lfn_active && lfn && lfn[0]) {
-        strncpy(out, lfn, out_size - 1);
-        out[out_size - 1] = '\0';
-        return;
+    if (lfn_state && fat32_lfn_validate(lfn_state, entry->name)) {
+        fat32_lfn_to_utf8(lfn_state->units, out, out_size);
+        if (out[0]) return;
     }
 
     fat32_format_entry_name(entry, out);
@@ -430,7 +519,7 @@ static void fat32_entry_display_name(const fat32_dir_entry_t *entry, const char 
  * @brief Searches for a directory entry by name within a specific directory cluster.
  * Supports both short names (8.3) and Long File Names (LFN).
  */
-static int fat32_find_entry_in_dir(uint32_t dir_cluster, const char *name, fat32_dir_entry_t *out_entry, uint32_t *out_index) {
+static int fat32_find_entry_in_dir(uint32_t dir_cluster, const char *name, fat32_dir_entry_t *out_entry, uint32_t *out_index, uint32_t *out_cluster) {
     char target[11];
     int has_short_target;
 
@@ -446,11 +535,12 @@ static int fat32_find_entry_in_dir(uint32_t dir_cluster, const char *name, fat32
         return 0;
     }
 
-    while (fat32_valid_cluster(cluster)) {
-        char lfn[256];
-        int lfn_active = 0;
+    uint32_t visited = 0;
+    while (fat32_valid_cluster(cluster) && visited <= global_fat32_mount->max_clusters) {
+        visited++;
+        fat32_lfn_state_t lfn_state;
 
-        memset(lfn, 0, sizeof(lfn));
+        fat32_lfn_reset(&lfn_state);
         uint32_t lba = fat32_cluster_to_lba(global_fat32_mount, cluster);
         if (vfs_read_device(global_fat32_mount->device, lba * 512, cluster_size, dir_buf) < 0) {
             kfree(dir_buf);
@@ -465,38 +555,37 @@ static int fat32_find_entry_in_dir(uint32_t dir_cluster, const char *name, fat32
             }
 
             if (fat32_entry_is_lfn(&entry[i])) {
-                fat32_lfn_entry_t *lfn_entry = (fat32_lfn_entry_t *)&entry[i];
-                if (lfn_entry->order & 0x40) {
-                    memset(lfn, 0, sizeof(lfn));
-                    lfn_active = 1;
-                }
-                if (lfn_active) {
-                    fat32_lfn_store_entry(lfn_entry, lfn);
-                }
+                fat32_lfn_feed(&lfn_state, (fat32_lfn_entry_t *)&entry[i]);
                 continue;
             }
 
             if ((unsigned char)entry[i].name[0] == 0xE5) {
-                memset(lfn, 0, sizeof(lfn));
-                lfn_active = 0;
+                fat32_lfn_reset(&lfn_state);
                 continue;
             }
             if (!fat32_entry_is_usable(&entry[i])) {
-                memset(lfn, 0, sizeof(lfn));
-                lfn_active = 0;
+                fat32_lfn_reset(&lfn_state);
                 continue;
             }
 
-            if ((lfn_active && fat32_str_equal_ci(lfn, name)) ||
-                (has_short_target && memcmp(entry[i].name, target, 11) == 0)) {
-                memcpy(out_entry, &entry[i], sizeof(fat32_dir_entry_t));
-                if (out_index) *out_index = i;
-                kfree(dir_buf);
-                return 1;
+            {
+                char lfn_utf8[768];
+                int has_lfn = fat32_lfn_validate(&lfn_state, entry[i].name);
+                if (has_lfn) fat32_lfn_to_utf8(lfn_state.units, lfn_utf8, sizeof(lfn_utf8));
+
+                if ((has_lfn && fat32_str_equal_ci(lfn_utf8, name)) ||
+                    (has_short_target && memcmp(entry[i].name, target, 11) == 0)) {
+                    memcpy(out_entry, &entry[i], sizeof(fat32_dir_entry_t));
+                    if (out_index) *out_index = i;
+                    // Track the actual cluster where the entry was found so callers
+                    // can pass it to fat32_write_entry_at correctly.
+                    if (out_cluster) *out_cluster = cluster;
+                    kfree(dir_buf);
+                    return 1;
+                }
             }
 
-            memset(lfn, 0, sizeof(lfn));
-            lfn_active = 0;
+            fat32_lfn_reset(&lfn_state);
         }
 
         cluster = fat32_get_next_cluster(global_fat32_mount, cluster);
@@ -532,10 +621,12 @@ static int fat32_find_free_slot_in_dir(uint32_t dir_cluster, uint32_t *out_index
     uint8_t *dir_buf = kmalloc(cluster_size);
     if (!dir_buf) return 0;
 
-    while (fat32_valid_cluster(cluster)) {
+    uint32_t visited = 0;
+    while (fat32_valid_cluster(cluster) && visited <= global_fat32_mount->max_clusters) {
+        visited++;
         uint32_t lba = fat32_cluster_to_lba(global_fat32_mount, cluster);
         vfs_read_device(global_fat32_mount->device, lba * 512, cluster_size, dir_buf);
-        
+
         fat32_dir_entry_t *entries = (fat32_dir_entry_t *)dir_buf;
         for (uint32_t i = 0; i < cluster_size / sizeof(fat32_dir_entry_t); i++) {
             if ((unsigned char)entries[i].name[0] == 0x00 || (unsigned char)entries[i].name[0] == 0xE5) {
@@ -544,7 +635,7 @@ static int fat32_find_free_slot_in_dir(uint32_t dir_cluster, uint32_t *out_index
                 return 1;
             }
         }
-        
+
         uint32_t next = fat32_get_next_cluster(global_fat32_mount, cluster);
         if (next >= 0x0FFFFFF8) {
             // Should extend directory here if needed, for now just fail if full.
@@ -607,7 +698,8 @@ static int fat32_resolve_path(const char *path, fat32_dir_entry_t *out_entry, ui
         }
 
         uint32_t entry_index = 0;
-        if (!fat32_find_entry_in_dir(current_cluster, component, &entry, &entry_index)) {
+        uint32_t entry_cluster = current_cluster;
+        if (!fat32_find_entry_in_dir(current_cluster, component, &entry, &entry_index, &entry_cluster)) {
             return 0;
         }
         found_any = 1;
@@ -623,7 +715,9 @@ static int fat32_resolve_path(const char *path, fat32_dir_entry_t *out_entry, ui
                 memcpy(out_entry, &entry, sizeof(fat32_dir_entry_t));
             }
             if (out_parent_cluster) {
-                *out_parent_cluster = current_cluster;
+                // Return the specific cluster that holds the entry, not just the
+                // directory start. fat32_write_entry_at reads this cluster directly.
+                *out_parent_cluster = entry_cluster;
             }
             if (out_index) {
                 *out_index = entry_index;
@@ -670,6 +764,10 @@ static vfs_node_t *fat32_mount(block_device_t *device) {
     mount->fat_start_lba = mount->bpb.reserved_sectors;
     mount->data_start_lba = mount->fat_start_lba + (mount->bpb.fat_count * mount->bpb.sectors_per_fat_32);
     mount->root_cluster = mount->bpb.root_cluster;
+    /* Each FAT sector holds 512/4 = 128 entries; this bounds the total
+     * number of distinct clusters the FAT can describe, regardless of what
+     * any individual chain claims. */
+    mount->max_clusters = mount->bpb.sectors_per_fat_32 * (512 / 4);
     global_fat32_mount = mount;
 
     fat32_node_t *root = kmalloc(sizeof(fat32_node_t));
@@ -737,15 +835,16 @@ void fat32_ls_path(const char *path) {
     klog("Name        Size\n");
     klog("------------------\n");
 
-    while (fat32_valid_cluster(cluster)) {
-        char lfn[256];
-        int lfn_active = 0;
+    uint32_t visited = 0;
+    while (fat32_valid_cluster(cluster) && visited <= global_fat32_mount->max_clusters) {
+        visited++;
+        fat32_lfn_state_t lfn_state;
         uint32_t lba = fat32_cluster_to_lba(global_fat32_mount, cluster);
         if (vfs_read_device(global_fat32_mount->device, lba * 512, cluster_size, dir_buf) < 0) {
             break;
         }
 
-        memset(lfn, 0, sizeof(lfn));
+        fat32_lfn_reset(&lfn_state);
         fat32_dir_entry_t *entry = (fat32_dir_entry_t *)dir_buf;
         for (uint32_t i = 0; i < cluster_size / sizeof(fat32_dir_entry_t); i++) {
             if ((unsigned char)entry[i].name[0] == 0x00) {
@@ -753,25 +852,17 @@ void fat32_ls_path(const char *path) {
                 return;
             }
             if (fat32_entry_is_lfn(&entry[i])) {
-                fat32_lfn_entry_t *lfn_entry = (fat32_lfn_entry_t *)&entry[i];
-                if (lfn_entry->order & 0x40) {
-                    memset(lfn, 0, sizeof(lfn));
-                    lfn_active = 1;
-                }
-                if (lfn_active) {
-                    fat32_lfn_store_entry(lfn_entry, lfn);
-                }
+                fat32_lfn_feed(&lfn_state, (fat32_lfn_entry_t *)&entry[i]);
                 continue;
             }
             if (!fat32_entry_is_usable(&entry[i])) {
-                memset(lfn, 0, sizeof(lfn));
-                lfn_active = 0;
+                fat32_lfn_reset(&lfn_state);
                 continue;
             }
 
-            char name[256];
+            char name[768];
             char size_str[16];
-            fat32_entry_display_name(&entry[i], lfn, lfn_active, name, sizeof(name));
+            fat32_entry_display_name(&entry[i], &lfn_state, name, sizeof(name));
             itoa(entry[i].size, size_str, 10);
 
             klog(name);
@@ -783,8 +874,7 @@ void fat32_ls_path(const char *path) {
                 klog(" bytes\n");
             }
 
-            memset(lfn, 0, sizeof(lfn));
-            lfn_active = 0;
+            fat32_lfn_reset(&lfn_state);
         }
 
         cluster = fat32_get_next_cluster(global_fat32_mount, cluster);
@@ -811,6 +901,11 @@ int fat32_load_file(const char *filename, uint8_t *buffer, uint32_t buffer_size,
 
     if (entry.size > buffer_size) {
         return 0;
+    }
+
+    if (entry.size == 0) {
+        *out_size = 0;
+        return 1;
     }
 
     fat32_node_t file_node;
@@ -887,13 +982,14 @@ int fat32_get_entry_by_index(const char *path, uint32_t index, char *out_name, i
     if (!dir_buf) return 0;
 
     uint32_t current_idx = 0;
-    while (fat32_valid_cluster(cluster)) {
-        char lfn[256];
-        int lfn_active = 0;
+    uint32_t visited = 0;
+    while (fat32_valid_cluster(cluster) && visited <= global_fat32_mount->max_clusters) {
+        visited++;
+        fat32_lfn_state_t lfn_state;
         uint32_t lba = fat32_cluster_to_lba(global_fat32_mount, cluster);
         if (vfs_read_device(global_fat32_mount->device, lba * 512, cluster_size, dir_buf) < 0) break;
 
-        memset(lfn, 0, sizeof(lfn));
+        fat32_lfn_reset(&lfn_state);
         fat32_dir_entry_t *entry = (fat32_dir_entry_t *)dir_buf;
         for (uint32_t i = 0; i < cluster_size / sizeof(fat32_dir_entry_t); i++) {
             if ((unsigned char)entry[i].name[0] == 0x00) {
@@ -901,31 +997,22 @@ int fat32_get_entry_by_index(const char *path, uint32_t index, char *out_name, i
                 return 0;
             }
             if (fat32_entry_is_lfn(&entry[i])) {
-                fat32_lfn_entry_t *lfn_entry = (fat32_lfn_entry_t *)&entry[i];
-                if (lfn_entry->order & 0x40) {
-                    memset(lfn, 0, sizeof(lfn));
-                    lfn_active = 1;
-                }
-                if (lfn_active) {
-                    fat32_lfn_store_entry(lfn_entry, lfn);
-                }
+                fat32_lfn_feed(&lfn_state, (fat32_lfn_entry_t *)&entry[i]);
                 continue;
             }
             if (!fat32_entry_is_usable(&entry[i])) {
-                memset(lfn, 0, sizeof(lfn));
-                lfn_active = 0;
+                fat32_lfn_reset(&lfn_state);
                 continue;
             }
 
             if (current_idx == index) {
-                fat32_entry_display_name(&entry[i], lfn, lfn_active, out_name, 64);
+                fat32_entry_display_name(&entry[i], &lfn_state, out_name, 64);
                 if (out_is_dir) *out_is_dir = fat32_entry_is_dir(&entry[i]);
                 kfree(dir_buf);
                 return 1;
             }
             current_idx++;
-            memset(lfn, 0, sizeof(lfn));
-            lfn_active = 0;
+            fat32_lfn_reset(&lfn_state);
         }
         cluster = fat32_get_next_cluster(global_fat32_mount, cluster);
     }

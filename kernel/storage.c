@@ -1,5 +1,6 @@
 #include "storage.h"
 #include "ata.h"
+#include "uhci.h"
 #include "blockdev.h"
 #include "partition.h"
 #include "vfs.h"
@@ -7,6 +8,16 @@
 
 void storage_init() {
     blockdev_init();
+
+    /* USB Mass Storage Etapa 0+1: controller detection and port reset only --
+     * no block_device_t yet (needs enumeration + Bulk-Only Transport first,
+     * see ROADMAP.md). klog the outcome so it's visible without the `usb`
+     * shell command. */
+    if (uhci_init() == 0) {
+        klog(uhci_status_string());
+    } else {
+        klog("USB: no UHCI controller found.\n");
+    }
 
     if (ata_init() == 0) {
         block_device_t *disk = ata_primary_master();

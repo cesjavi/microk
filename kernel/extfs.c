@@ -1,7 +1,7 @@
 #include "extfs.h"
 #include "kheap.h"
 #include "video.h"
-#include <string.h>
+#include "string.h"
 
 #define EXT_SUPERBLOCK_OFFSET 1024
 #define EXT_SUPERBLOCK_SIZE   1024
@@ -104,12 +104,31 @@ static int ext_read_superblock(block_device_t *device, ext_superblock_t *out) {
     return read_le16(out->magic) == EXT_MAGIC ? 0 : -1;
 }
 
-static uint32_t ext_block_offset(ext_mount_t *mount, uint32_t block) {
-    return block * mount->block_size;
+/* Indirect block pointers and inode->block[] entries come straight off
+ * disk; a corrupted filesystem can claim any 32-bit block number. Doing the
+ * multiply in 64 bits and rejecting results that don't fit back in the
+ * uint32_t offset vfs_read_device() takes prevents a block number near the
+ * top of the range from silently wrapping and landing on some other
+ * in-range, validly-readable offset instead of failing. */
+static int ext_block_offset_checked(ext_mount_t *mount, uint32_t block, uint32_t *out_offset) {
+    uint64_t offset64 = (uint64_t)block * (uint64_t)mount->block_size;
+    if (offset64 > 0xFFFFFFFFULL) {
+        return 0;
+    }
+    *out_offset = (uint32_t)offset64;
+    return 1;
 }
 
 static int ext_read_block(ext_mount_t *mount, uint32_t block, uint8_t *buffer) {
-    return vfs_read_device(mount->device, ext_block_offset(mount, block), mount->block_size, buffer) == (int)mount->block_size ? 0 : -1;
+    uint32_t blocks_count = read_le32(mount->superblock.blocks_count);
+    if (blocks_count && block >= blocks_count) {
+        return -1;
+    }
+    uint32_t offset;
+    if (!ext_block_offset_checked(mount, block, &offset)) {
+        return -1;
+    }
+    return vfs_read_device(mount->device, offset, mount->block_size, buffer) == (int)mount->block_size ? 0 : -1;
 }
 
 static int ext_read_group0(ext_mount_t *mount) {
@@ -119,12 +138,31 @@ static int ext_read_group0(ext_mount_t *mount) {
 }
 
 static int ext_read_group_desc(ext_mount_t *mount, uint32_t group, ext_group_desc_t *out) {
+    uint32_t blocks_per_group;
+    uint32_t blocks_count;
+    uint32_t group_count;
+    uint32_t gd_table;
+    uint32_t offset;
+
     if (!mount || !out) {
         return -1;
     }
 
-    uint32_t gd_table = mount->block_size == 1024 ? 2048 : mount->block_size;
-    uint32_t offset = gd_table + (group * sizeof(ext_group_desc_t));
+    /* A corrupted inode_num (or inodes_per_group) can drive `group` to an
+     * arbitrary value; without bounding it against the real group count,
+     * the computed offset could land anywhere on the device. */
+    blocks_per_group = read_le32(mount->superblock.blocks_per_group);
+    blocks_count = read_le32(mount->superblock.blocks_count);
+    if (blocks_per_group == 0) {
+        return -1;
+    }
+    group_count = (blocks_count + blocks_per_group - 1) / blocks_per_group;
+    if (group_count == 0 || group >= group_count) {
+        return -1;
+    }
+
+    gd_table = mount->block_size == 1024 ? 2048 : mount->block_size;
+    offset = gd_table + (group * sizeof(ext_group_desc_t));
     return vfs_read_device(mount->device, offset, sizeof(ext_group_desc_t), (uint8_t *)out) == sizeof(ext_group_desc_t) ? 0 : -1;
 }
 
@@ -146,9 +184,34 @@ static int ext_read_inode(ext_mount_t *mount, uint32_t inode_num, ext_inode_t *o
         return -1;
     }
 
-    uint32_t table_offset = ext_block_offset(mount, read_le32(desc.inode_table));
-    uint32_t inode_offset = table_offset + (local_index * mount->inode_size);
+    uint32_t table_offset;
+    if (!ext_block_offset_checked(mount, read_le32(desc.inode_table), &table_offset)) {
+        return -1;
+    }
+    uint64_t inode_offset64 = (uint64_t)table_offset + (uint64_t)local_index * (uint64_t)mount->inode_size;
+    if (inode_offset64 > 0xFFFFFFFFULL) {
+        return -1;
+    }
+    uint32_t inode_offset = (uint32_t)inode_offset64;
     return vfs_read_device(mount->device, inode_offset, sizeof(ext_inode_t), (uint8_t *)out) == sizeof(ext_inode_t) ? 0 : -1;
+}
+
+/* A corrupted or maliciously crafted directory entry could declare a
+ * name_len that extends past what rec_len actually reserves, or a rec_len
+ * that extends past the end of the block buffer. Without this check,
+ * ext_name_equals()/memcpy() below would read past the heap-allocated
+ * block_buf -- an out-of-bounds read driven entirely by on-disk data. */
+static int ext_dir_entry_valid(uint32_t pos, const ext_dir_entry_t *entry, uint32_t block_size) {
+    if (entry->rec_len < sizeof(ext_dir_entry_t)) {
+        return 0;
+    }
+    if (pos + entry->rec_len > block_size) {
+        return 0;
+    }
+    if ((uint32_t)sizeof(ext_dir_entry_t) + entry->name_len > entry->rec_len) {
+        return 0;
+    }
+    return 1;
 }
 
 static int ext_name_equals(const char *name, const char *entry_name, uint8_t entry_len) {
@@ -250,6 +313,9 @@ static int ext_find_entry_in_dir(ext_mount_t *mount, ext_inode_t *dir, const cha
         while (pos + sizeof(ext_dir_entry_t) <= mount->block_size) {
             ext_dir_entry_t *entry = (ext_dir_entry_t *)(block_buf + pos);
             if (entry->rec_len == 0) {
+                break;
+            }
+            if (!ext_dir_entry_valid(pos, entry, mount->block_size)) {
                 break;
             }
             if (entry->inode && entry->name_len && ext_name_equals(filename, (char *)(entry + 1), entry->name_len)) {
@@ -366,9 +432,26 @@ static vfs_node_t *ext_mount(block_device_t *device) {
     }
 
     mount->device = device;
-    mount->block_size = 1024 << read_le32(mount->superblock.log_block_size);
+    uint32_t log_shift = read_le32(mount->superblock.log_block_size);
+    if (log_shift > 6) log_shift = 6; // ext2/3/4 max valid shift is 6 (64 KB blocks)
+    mount->block_size = 1024 << log_shift;
     mount->inode_size = mount->superblock.inode_size ? read_le16(mount->superblock.inode_size) : 128;
     mount->variant = ext_variant(&mount->superblock);
+
+    /* Sanity-check the fields every other read path trusts (group/inode
+     * indexing, block bounds) before mounting at all -- a corrupted or
+     * crafted superblock with e.g. inodes_per_group=0 or an absurd
+     * inode_size would otherwise only surface as a divide-by-zero or an
+     * out-of-range read much later, in a less obvious place. */
+    if (read_le32(mount->superblock.blocks_count) == 0 ||
+        read_le32(mount->superblock.inodes_count) == 0 ||
+        read_le32(mount->superblock.blocks_per_group) == 0 ||
+        read_le32(mount->superblock.inodes_per_group) == 0 ||
+        mount->inode_size < 128 || mount->inode_size > mount->block_size) {
+        kfree(mount);
+        return 0;
+    }
+
     if (ext_read_group0(mount) != 0) {
         kfree(mount);
         return 0;
@@ -434,6 +517,9 @@ void extfs_ls() {
         while (pos + sizeof(ext_dir_entry_t) <= global_ext_mount->block_size) {
             ext_dir_entry_t *entry = (ext_dir_entry_t *)(block_buf + pos);
             if (entry->rec_len == 0) {
+                break;
+            }
+            if (!ext_dir_entry_valid(pos, entry, global_ext_mount->block_size)) {
                 break;
             }
             if (entry->inode && entry->name_len) {

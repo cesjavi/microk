@@ -128,6 +128,7 @@ static uint32_t ata_block_read(block_device_t *device, uint32_t offset, uint32_t
         uint32_t chunk = 512 - sector_offset;
         if (chunk > size - done) chunk = size - done;
 
+        if (lba >= drive->sectors) break;
         if (ata_read_sector(drive, lba, sector) != 0) {
             break;
         }
@@ -150,6 +151,7 @@ static uint32_t ata_block_write(block_device_t *device, uint32_t offset, uint32_
         uint32_t chunk = 512 - sector_offset;
         if (chunk > size - done) chunk = size - done;
 
+        if (lba >= drive->sectors) break;
         if (chunk < 512) {
             // Partial write: read-modify-write
             if (ata_read_sector(drive, lba, sector) != 0) break;

@@ -57,13 +57,20 @@ static uint32_t partition_read(block_device_t *device, uint32_t offset, uint32_t
     partition_device_t *part = (partition_device_t *)device->driver_data;
     if (!part || !part->parent || !buffer) return 0;
 
-    uint32_t start = part->first_lba * SECTOR_SIZE;
-    uint32_t limit = part->sectors * SECTOR_SIZE;
+    /* first_lba/sectors come from an on-disk MBR/GPT entry; do the scaling
+     * and final offset math in 64 bits so a partition that starts beyond
+     * ~4GiB into the disk fails instead of silently wrapping to a smaller,
+     * wrong 32-bit offset (the parent device's read() only takes a 32-bit
+     * offset, so anything past that genuinely cannot be serviced here). */
+    uint64_t start = (uint64_t)part->first_lba * SECTOR_SIZE;
+    uint64_t limit = (uint64_t)part->sectors * SECTOR_SIZE;
     if (offset >= limit) return 0;
-    if (offset + size > limit) {
-        size = limit - offset;
+    if ((uint64_t)offset + size > limit) {
+        size = (uint32_t)(limit - offset);
     }
-    return part->parent->read(part->parent, start + offset, size, buffer);
+    uint64_t final_offset = start + offset;
+    if (final_offset > 0xFFFFFFFFULL) return 0;
+    return part->parent->read(part->parent, (uint32_t)final_offset, size, buffer);
 }
 
 static void make_partition_name(char *out, const char *disk_name, int index) {
@@ -160,11 +167,16 @@ int partition_scan_gpt(block_device_t *disk) {
     }
 
     for (uint32_t i = 0; i < entries; i++) {
-        uint32_t entry_offset = (uint32_t)(header->partition_entry_lba * SECTOR_SIZE) + (i * header->partition_entry_size);
+        uint64_t entry_offset64 = header->partition_entry_lba * (uint64_t)SECTOR_SIZE +
+                                   (uint64_t)i * header->partition_entry_size;
         uint8_t entry_buffer[128];
         if (header->partition_entry_size > sizeof(entry_buffer)) {
             continue;
         }
+        if (entry_offset64 > 0xFFFFFFFFULL) {
+            continue;
+        }
+        uint32_t entry_offset = (uint32_t)entry_offset64;
         if (disk->read(disk, entry_offset, header->partition_entry_size, entry_buffer) != header->partition_entry_size) {
             continue;
         }
