@@ -44,7 +44,7 @@ void boot_modules_load(multiboot_info_t *mbi) {
             const char *name = (const char *)mods[i].string;
             if (!initrd_loaded && module_is_initrd(name)) {
                 klog("Loading Initrd Module...");
-                initialise_initrd(mods[i].mod_start);
+                initialise_initrd(mods[i].mod_start, mods[i].mod_end);
                 initrd_loaded = 1;
             } else if (!model_loaded && (module_is_model(name) || module_has_model_magic(&mods[i]))) {
                 klog("Loading LLM Model Module...");
@@ -55,7 +55,7 @@ void boot_modules_load(multiboot_info_t *mbi) {
 
         if (!initrd_loaded && mbi->mods_count == 1 && !model_loaded) {
             klog("Loading Initrd Module...");
-            initialise_initrd(mods[0].mod_start);
+            initialise_initrd(mods[0].mod_start, mods[0].mod_end);
         }
     }
 

@@ -11,6 +11,8 @@ typedef struct {
     fixed_t *data;
     int is_owner; // If 1, we should kfree data
     uint32_t gguf_offset; // Offset in GGUF file (if applicable)
+    uint32_t gguf_type;   // GGML_TYPE_* of the source GGUF tensor, for views
+                          // (0/GGML_TYPE_F32 if not loaded from a GGUF view)
 } tensor_t;
 
 tensor_t *tensor_create(uint32_t ndims, uint32_t *dims);
@@ -23,6 +25,7 @@ tensor_t *tensor_load_gguf(uint32_t file_start, uint32_t file_size, const char *
 tensor_t *tensor_load_gguf_view(uint32_t file_start, uint32_t file_size, const char *name);
 int tensor_read_gguf_row_into(uint32_t file_start, uint32_t file_size, const char *name, uint32_t row_index, fixed_t *out, uint32_t out_count);
 void dequantize_q4_0(fixed_t *out, const uint8_t *in, uint32_t count);
+void dequantize_q6_k(fixed_t *out, const uint8_t *in, uint32_t count);
 
 typedef enum {
     ACT_RELU,

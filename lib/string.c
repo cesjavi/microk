@@ -13,6 +13,26 @@ void *memcpy(void *dest, const void *src, size_t n) {
     return dest;
 }
 
+/* memcpy is undefined for overlapping ranges regardless of which direction
+ * a particular implementation happens to copy in -- needed for framebuffer
+ * scrolling, which shifts content toward lower addresses (dest < src) by
+ * design. */
+void *memmove(void *dest, const void *src, size_t n) {
+    unsigned char *d = dest;
+    const unsigned char *s = src;
+    if (d == s || n == 0) {
+        return dest;
+    }
+    if (d < s) {
+        while (n--) *d++ = *s++;
+    } else {
+        d += n;
+        s += n;
+        while (n--) *(--d) = *(--s);
+    }
+    return dest;
+}
+
 size_t strlen(const char *s) {
     size_t len = 0;
     while (s[len]) len++;

@@ -22,5 +22,10 @@ void llm_set_trace(int enabled);
 int llm_trace_enabled(void);
 void llm_inference(const char *prompt, char *response);
 void sys_llm_query(const char *prompt, char *response);
+/* Returns 1=PASS (tokens generated), -1=FAIL (0 tokens), 0=SKIP (not GGUF-GEN) */
+int llm_gguf_selftest(void);
+/* Diagnostic: dumps hidden-state energy + top-5 output logits for the token
+ * right after `prompt` to the kernel log, instead of generating text. */
+void llm_dump_logits(const char *prompt, char *response);
 
 #endif

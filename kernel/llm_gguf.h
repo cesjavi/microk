@@ -25,6 +25,10 @@ typedef enum {
     GGML_TYPE_Q4_0 = 2,
     GGML_TYPE_Q4_1 = 3,
     // ...
+    GGML_TYPE_Q6_K = 14, /* legacy llama.cpp quantizations (e.g. plain "Q4_0")
+                          * commonly keep output.weight/token_embd.weight at
+                          * Q6_K for quality even though the rest of the
+                          * model is Q4_0 -- e.g. TinyLlama-1.1B-Chat Q4_0.gguf. */
     GGML_TYPE_I8   = 16,
     GGML_TYPE_I16  = 17,
     GGML_TYPE_I32  = 18,
@@ -62,8 +66,34 @@ typedef struct {
 } gguf_tensor_t;
 
 int gguf_probe(uint32_t start, uint32_t size, gguf_info_t *info);
+void gguf_probe_invalidate(void);
 int gguf_get_tensor(uint32_t start, uint32_t size, const char *name, gguf_tensor_t *tensor);
 int gguf_get_metadata_array(uint32_t start, uint32_t size, const char *key, uint32_t *out_count, uint8_t **out_ptr);
 int gguf_get_metadata_value(uint32_t start, uint32_t size, const char *key, uint32_t expected_type, void *out_val);
+
+/* Optional high-memory (>4GB PAE) backing for a GGUF file's tensor DATA
+ * section (everything from data_offset onward -- the header/metadata/vocab
+ * section before it is never migrated and stays directly low-memory
+ * readable). Single-slot, single-model: matches gguf_probe's own
+ * (start,size)-keyed single-slot cache above, since MicroK only ever has one
+ * model loaded at a time. */
+
+/* Attempts to move [file_start+data_offset, file_start+file_size) into a
+ * high-memory hbuf_t and reclaim the low-memory pages that held it. No-op
+ * (returns 0, changes nothing) if there's no usable high-memory pool or the
+ * data section is too small to bother with -- always safe to call. */
+int gguf_migrate_data_to_high_mem(uint32_t file_start, uint32_t file_size, uint32_t data_offset);
+
+/* Frees the high-memory backing for file_start, if it currently owns one.
+ * Call before loading a new/different model so repeated loads don't leak
+ * high-pool pages. Safe to call even if nothing was ever migrated. */
+void gguf_release_high_mem_backing(uint32_t file_start);
+
+/* Reads `len` bytes at tensor_offset (relative to data_offset, i.e. the same
+ * value gguf_tensor_t.offset uses) into `out`. Transparently goes through
+ * the high-memory backing if file_start was migrated, otherwise falls back
+ * to the direct low-memory read every call site used before this existed --
+ * callers never need to know which. Returns 1 on success. */
+int gguf_read_data_bytes(uint32_t file_start, uint32_t file_size, uint32_t data_offset, uint32_t tensor_offset, void *out, uint32_t len);
 
 #endif

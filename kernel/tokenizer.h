@@ -6,6 +6,7 @@
 typedef struct {
     uint32_t vocab_size;
     char **tokens;
+    uint32_t *lengths; /* cached strlen(tokens[i]), avoids recomputing it on every BPE merge-candidate lookup */
     float *scores;
 } tokenizer_t;
 

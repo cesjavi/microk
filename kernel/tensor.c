@@ -63,9 +63,19 @@ tensor_t *tensor_create(uint32_t ndims, uint32_t *dims) {
     t->count = 1;
     for (uint32_t i = 0; i < ndims; i++) {
         t->dims[i] = dims[i];
+        if (dims[i] > 0 && t->count > 0xFFFFFFFFU / dims[i]) {
+            tensor_set_error("tensor dimension product overflows uint32_t.");
+            kfree(t);
+            return NULL;
+        }
         t->count *= dims[i];
     }
-    
+    if (t->count == 0) {
+        tensor_set_error("tensor has zero elements.");
+        kfree(t);
+        return NULL;
+    }
+
     t->data = kmalloc(t->count * sizeof(fixed_t));
     if (!t->data) {
         tensor_set_error("kmalloc failed for tensor data.");
@@ -109,10 +119,70 @@ void dequantize_q4_0(fixed_t *out, const uint8_t *in, uint32_t count) {
     }
 }
 
+/**
+ * @brief De-quantizes Q6_K super-blocks into fixed-point values.
+ * Q6_K block (210 bytes, 256 elements): 128 bytes low-4-bit quants (ql),
+ * 64 bytes high-2-bit quants (qh), 16 bytes int8 per-16-element sub-scales,
+ * 2 bytes f16 super-block scale (d). Legacy llama.cpp quantizations (e.g.
+ * plain "Q4_0" files) commonly keep output.weight at Q6_K for quality even
+ * though every other tensor is Q4_0 -- e.g. TinyLlama-1.1B-Chat's
+ * tinyllama-1.1b-chat-v1.0.Q4_0.gguf. Mirrors ggml's reference
+ * dequantize_row_q6_K bit-for-bit, just emitting fixed_t instead of float.
+ */
+void dequantize_q6_k(fixed_t *out, const uint8_t *in, uint32_t count) {
+    for (uint32_t b = 0; b < count / 256; b++) {
+        const uint8_t *block = in + b * 210;
+        const uint8_t *ql = block;
+        const uint8_t *qh = block + 128;
+        const int8_t *sc = (const int8_t *)(block + 192);
+        uint16_t d_f16 = *(const uint16_t *)(block + 208);
+        fixed_t d = float_to_fixed(f16_to_float(d_f16));
+        fixed_t *y = out + (size_t)b * 256;
+
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l +  0] >>   4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >>   4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                y[l +  0] = fixed_mul(fixed_mul(d, int_to_fixed(sc[is + 0])), int_to_fixed(q1));
+                y[l + 32] = fixed_mul(fixed_mul(d, int_to_fixed(sc[is + 2])), int_to_fixed(q2));
+                y[l + 64] = fixed_mul(fixed_mul(d, int_to_fixed(sc[is + 4])), int_to_fixed(q3));
+                y[l + 96] = fixed_mul(fixed_mul(d, int_to_fixed(sc[is + 6])), int_to_fixed(q4));
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+/* Reused row-scratch buffer, grown lazily and kept across calls instead of
+ * malloc/free per row -- tensor_read_gguf_row_into() is the fallback path
+ * for the argmax vocab scan in kernel/llm.c when the output tensor isn't
+ * Q4_0/Q6_K, so it can run once per candidate token (tens of thousands of
+ * times per generated token); a fresh kmalloc/kfree pair on every call was
+ * a real, measured slowdown once this started going through
+ * gguf_read_data_bytes() instead of a bare pointer. */
+static uint8_t *tensor_row_scratch = NULL;
+static uint32_t tensor_row_scratch_cap = 0;
+
+static uint8_t *tensor_row_scratch_ensure(uint32_t needed) {
+    if (needed <= tensor_row_scratch_cap) return tensor_row_scratch;
+    uint8_t *grown = kmalloc(needed);
+    if (!grown) return NULL;
+    if (tensor_row_scratch) kfree(tensor_row_scratch);
+    tensor_row_scratch = grown;
+    tensor_row_scratch_cap = needed;
+    return tensor_row_scratch;
+}
+
 int tensor_read_gguf_row_into(uint32_t file_start, uint32_t file_size, const char *name, uint32_t row_index, fixed_t *out, uint32_t out_count) {
     gguf_tensor_t ginfo;
     gguf_info_t info;
-    uint8_t *src;
     uint32_t row_width;
     uint32_t row_count;
 
@@ -144,31 +214,61 @@ int tensor_read_gguf_row_into(uint32_t file_start, uint32_t file_size, const cha
         return 0;
     }
 
-    src = (uint8_t *)(file_start + info.data_offset + ginfo.offset);
+    /* Row bytes are read through gguf_read_data_bytes() (a scratch copy)
+     * instead of a direct pointer, so this works whether the model's tensor
+     * DATA section is still low-memory-resident or was migrated to high
+     * memory -- see kernel/llm_gguf.c. */
+    uint32_t row_byte_offset;
+    uint32_t row_byte_len;
     if (ginfo.type == GGML_TYPE_F32) {
-        float *fsrc = (float *)src + (row_index * row_width);
-        for (uint32_t i = 0; i < row_width; i++) {
-            out[i] = float_to_fixed(fsrc[i]);
-        }
+        row_byte_len = row_width * 4;
+        row_byte_offset = ginfo.offset + row_index * row_byte_len;
     } else if (ginfo.type == GGML_TYPE_F16) {
-        uint16_t *hsrc = (uint16_t *)src + (row_index * row_width);
-        for (uint32_t i = 0; i < row_width; i++) {
-            out[i] = float_to_fixed(f16_to_float(hsrc[i]));
-        }
+        row_byte_len = row_width * 2;
+        row_byte_offset = ginfo.offset + row_index * row_byte_len;
     } else if (ginfo.type == GGML_TYPE_Q4_0) {
-        uint32_t blocks_per_row;
-        uint8_t *row_src;
-
         if ((row_width % 32) != 0) {
             tensor_set_error("Q4_0 row width must be multiple of 32.");
             return 0;
         }
-        blocks_per_row = row_width / 32;
-        row_src = src + (row_index * blocks_per_row * 18);
-        dequantize_q4_0(out, row_src, row_width);
+        row_byte_len = (row_width / 32) * 18;
+        row_byte_offset = ginfo.offset + row_index * row_byte_len;
+    } else if (ginfo.type == GGML_TYPE_Q6_K) {
+        if ((row_width % 256) != 0) {
+            tensor_set_error("Q6_K row width must be multiple of 256.");
+            return 0;
+        }
+        row_byte_len = (row_width / 256) * 210;
+        row_byte_offset = ginfo.offset + row_index * row_byte_len;
     } else {
         tensor_set_error("GGUF tensor type not supported.");
         return 0;
+    }
+
+    uint8_t *row_buf = tensor_row_scratch_ensure(row_byte_len);
+    if (!row_buf) {
+        tensor_set_error("kmalloc failed for GGUF row scratch copy.");
+        return 0;
+    }
+    if (!gguf_read_data_bytes(file_start, file_size, info.data_offset, row_byte_offset, row_buf, row_byte_len)) {
+        tensor_set_error("GGUF row data read failed.");
+        return 0;
+    }
+
+    if (ginfo.type == GGML_TYPE_F32) {
+        float *fsrc = (float *)row_buf;
+        for (uint32_t i = 0; i < row_width; i++) {
+            out[i] = float_to_fixed(fsrc[i]);
+        }
+    } else if (ginfo.type == GGML_TYPE_F16) {
+        uint16_t *hsrc = (uint16_t *)row_buf;
+        for (uint32_t i = 0; i < row_width; i++) {
+            out[i] = float_to_fixed(f16_to_float(hsrc[i]));
+        }
+    } else if (ginfo.type == GGML_TYPE_Q4_0) {
+        dequantize_q4_0(out, row_buf, row_width);
+    } else if (ginfo.type == GGML_TYPE_Q6_K) {
+        dequantize_q6_k(out, row_buf, row_width);
     }
 
     tensor_set_error("");
@@ -198,7 +298,8 @@ tensor_t *tensor_load_gguf_view(uint32_t file_start, uint32_t file_size, const c
     t->data = NULL;
     t->is_owner = 0;
     t->gguf_offset = ginfo.offset;
-    
+    t->gguf_type = ginfo.type;
+
     tensor_set_error("");
     return t;
 }
@@ -217,12 +318,45 @@ tensor_t *tensor_load_gguf(uint32_t file_start, uint32_t file_size, const char *
     tensor_t *t = tensor_create(ginfo.ndims, ginfo.dims);
     if (!t) return NULL;
     t->gguf_offset = ginfo.offset;
-    
+    t->gguf_type = ginfo.type;
+
     gguf_info_t info;
     gguf_probe(file_start, file_size, &info);
-    
-    uint8_t *src = (uint8_t *)(file_start + info.data_offset + ginfo.offset);
-    
+
+    /* tensor_load_gguf() is only ever used for small tensors (norm weights:
+     * a few KB each), so a one-shot scratch copy is cheap. This indirection
+     * (instead of a direct pointer into the file) is what lets the model's
+     * tensor DATA section live in high memory -- see
+     * gguf_read_data_bytes()/gguf_migrate_data_to_high_mem() in
+     * kernel/llm_gguf.c. */
+    uint32_t byte_len;
+    if (ginfo.type == GGML_TYPE_F32) {
+        byte_len = t->count * 4;
+    } else if (ginfo.type == GGML_TYPE_F16) {
+        byte_len = t->count * 2;
+    } else if (ginfo.type == GGML_TYPE_Q4_0) {
+        byte_len = (t->count / 32) * 18;
+    } else if (ginfo.type == GGML_TYPE_Q6_K) {
+        byte_len = (t->count / 256) * 210;
+    } else {
+        tensor_set_error("GGUF tensor type not supported.");
+        tensor_free(t);
+        return NULL;
+    }
+
+    uint8_t *src = kmalloc(byte_len);
+    if (!src) {
+        tensor_set_error("kmalloc failed for GGUF tensor scratch copy.");
+        tensor_free(t);
+        return NULL;
+    }
+    if (!gguf_read_data_bytes(file_start, file_size, info.data_offset, ginfo.offset, src, byte_len)) {
+        tensor_set_error("GGUF tensor data read failed.");
+        kfree(src);
+        tensor_free(t);
+        return NULL;
+    }
+
     if (ginfo.type == GGML_TYPE_F32) {
         float *fsrc = (float *)src;
         for (uint32_t i = 0; i < t->count; i++) {
@@ -235,12 +369,11 @@ tensor_t *tensor_load_gguf(uint32_t file_start, uint32_t file_size, const char *
         }
     } else if (ginfo.type == GGML_TYPE_Q4_0) {
         dequantize_q4_0(t->data, src, t->count);
-    } else {
-        tensor_set_error("GGUF tensor type not supported.");
-        tensor_free(t);
-        return NULL;
+    } else if (ginfo.type == GGML_TYPE_Q6_K) {
+        dequantize_q6_k(t->data, src, t->count);
     }
 
+    kfree(src);
     tensor_set_error("");
     return t;
 }
@@ -350,18 +483,26 @@ int tensor_rope(tensor_t *t, uint32_t pos, uint32_t n_head, uint32_t head_dim) {
     
     for (uint32_t h = 0; h < n_head; h++) {
         for (uint32_t i = 0; i < head_dim / 2; i++) {
-            // Basic RoPE: rotate pairs
+            /* GGUF/GGML weights for llama2.c-style checkpoints (e.g. stories15M)
+             * are laid out for the "original" RoPE convention, which rotates
+             * CONSECUTIVE dimension pairs (2i, 2i+1) within each head. The
+             * split-half convention (i, i+head_dim/2) is HuggingFace's
+             * rotate_half style, which only matches when the Q/K weights were
+             * permuted during HF conversion -- these weren't, since they were
+             * loaded straight from the GGUF tensors. Using the wrong pairing
+             * scrambles attention more and more as position grows, producing
+             * a few sane words followed by garbled subword salad. */
             fixed_t theta = fixed_div(FIXED_ONE, fixed_pow(int_to_fixed(10000), float_to_fixed((float)(2 * i) / (float)head_dim)));
             fixed_t f_theta = fixed_mul(theta, int_to_fixed(pos));
             fixed_t cos_val = fixed_cos(f_theta);
             fixed_t sin_val = fixed_sin(f_theta);
-            
-            uint32_t idx1 = h * head_dim + i;
-            uint32_t idx2 = h * head_dim + i + head_dim / 2;
-            
+
+            uint32_t idx1 = h * head_dim + 2 * i;
+            uint32_t idx2 = h * head_dim + 2 * i + 1;
+
             fixed_t x1 = t->data[idx1];
             fixed_t x2 = t->data[idx2];
-            
+
             t->data[idx1] = fixed_mul(x1, cos_val) - fixed_mul(x2, sin_val);
             t->data[idx2] = fixed_mul(x1, sin_val) + fixed_mul(x2, cos_val);
         }

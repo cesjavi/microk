@@ -15,7 +15,7 @@ typedef struct {
     uint32_t length;
 } initrd_file_header_t;
 
-vfs_node_t *initialise_initrd(uint32_t location);
+vfs_node_t *initialise_initrd(uint32_t location, uint32_t end);
 vfs_node_t *initrd_find_node(const char *name);
 
 #endif
