@@ -47,7 +47,7 @@ static uint32_t detect_memory_size(multiboot_info_t *mbi) {
     if (mbi->flags & MULTIBOOT_FLAG_MMAP) {
         uint32_t offset = 0;
         while (offset < mbi->mmap_length) {
-            multiboot_mmap_entry_t *entry = (multiboot_mmap_entry_t *)(mbi->mmap_addr + offset);
+            multiboot_mmap_entry_t *entry = (multiboot_mmap_entry_t *)(uintptr_t)(mbi->mmap_addr + offset);
             uint32_t base = entry->base_addr_low;
             uint32_t length = entry->length_low;
             uint32_t end;
@@ -91,7 +91,7 @@ static void free_usable_memory(multiboot_info_t *mbi, uint32_t mem_size) {
     if (mbi->flags & MULTIBOOT_FLAG_MMAP) {
         uint32_t offset = 0;
         while (offset < mbi->mmap_length) {
-            multiboot_mmap_entry_t *entry = (multiboot_mmap_entry_t *)(mbi->mmap_addr + offset);
+            multiboot_mmap_entry_t *entry = (multiboot_mmap_entry_t *)(uintptr_t)(mbi->mmap_addr + offset);
             pmm_record_high_memory_region(
                 entry->base_addr_low,
                 entry->base_addr_high,
@@ -130,10 +130,10 @@ static void free_usable_memory(multiboot_info_t *mbi, uint32_t mem_size) {
 
 static uint32_t reserve_kernel_and_modules(multiboot_info_t *mbi) {
     extern uint32_t kernel_end;
-    uint32_t reserved_end = (uint32_t)&kernel_end;
+    uint32_t reserved_end = (uint32_t)(uintptr_t)&kernel_end;
 
     if (mbi->flags & MULTIBOOT_FLAG_MODS) {
-        multiboot_module_t *mods = (multiboot_module_t *)mbi->mods_addr;
+        multiboot_module_t *mods = (multiboot_module_t *)(uintptr_t)mbi->mods_addr;
         for (uint32_t i = 0; i < mbi->mods_count; i++) {
             if (mods[i].mod_end > reserved_end) {
                 reserved_end = mods[i].mod_end;
@@ -152,7 +152,7 @@ static uint32_t multiboot_module_reserved_bytes(multiboot_info_t *mbi) {
     uint32_t bytes = 0;
 
     if (mbi->flags & MULTIBOOT_FLAG_MODS) {
-        multiboot_module_t *mods = (multiboot_module_t *)mbi->mods_addr;
+        multiboot_module_t *mods = (multiboot_module_t *)(uintptr_t)mbi->mods_addr;
         for (uint32_t i = 0; i < mbi->mods_count; i++) {
             uint32_t start = align_down(mods[i].mod_start);
             uint32_t end = ALIGN_UP(mods[i].mod_end, PAGE_SIZE);
@@ -165,7 +165,7 @@ static uint32_t multiboot_module_reserved_bytes(multiboot_info_t *mbi) {
 
 static void reserve_multiboot_modules(multiboot_info_t *mbi) {
     if (mbi->flags & MULTIBOOT_FLAG_MODS) {
-        multiboot_module_t *mods = (multiboot_module_t *)mbi->mods_addr;
+        multiboot_module_t *mods = (multiboot_module_t *)(uintptr_t)mbi->mods_addr;
         for (uint32_t i = 0; i < mbi->mods_count; i++) {
             pmm_reserve_region(mods[i].mod_start, mods[i].mod_end - mods[i].mod_start);
         }
@@ -201,7 +201,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     enable_sse();
 
     serial_init();
-    multiboot_info_t *mbi = (multiboot_info_t *)mb_info;
+    multiboot_info_t *mbi = (multiboot_info_t *)(uintptr_t)mb_info;
 
     video_init(mbi);
     video_clear(0x00000000);
@@ -267,28 +267,28 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     
     // Set kernel stack for TSS (so we can return to kernel from Ring 3)
     extern uint32_t stack_top;
-    tss_set_stack((uint32_t)&stack_top);
+    tss_set_stack((uint32_t)(uintptr_t)&stack_top);
 
     klog("System Ready. Welcome to MicroK AI-Native OS.");
+    klog("Starting background network poll task...");
+    task_create(net_poll_task);
+
     klog("Starting Isolated Shell (Ring 3)...");
-    
+
     extern void jump_usermode(uint32_t eip, uint32_t esp);
     
-    // Allocate a temporary stack for the user mode shell
-    uint8_t *user_stack = kmalloc(4096);
-    if (!user_stack) {
+    // Allocate a dedicated physical page for the user-mode shell stack.
+    // Using pmm_alloc_block() instead of kmalloc() avoids exposing the kernel
+    // heap virtual range to user mode through the 0x07 (user+RW) mapping.
+    uint32_t stack_page = (uint32_t)(uintptr_t)pmm_alloc_block();
+    if (!stack_page) {
         klog("Failed to allocate user shell stack.");
         while (1) {
         }
     }
+    vmm_map_page_ext(stack_page, stack_page, 0x07);
 
-    uint32_t stack_start = ALIGN_DOWN((uint32_t)user_stack, PAGE_SIZE);
-    uint32_t stack_end = ALIGN_UP((uint32_t)user_stack + 4096, PAGE_SIZE);
-    for (uint32_t page = stack_start; page < stack_end; page += PAGE_SIZE) {
-        vmm_map_page_ext(page, page, 0x07);
-    }
-
-    uint32_t user_esp = (uint32_t)user_stack + 4096;
+    uint32_t user_esp = stack_page + PAGE_SIZE;
     
-    jump_usermode((uint32_t)shell_task, user_esp);
+    jump_usermode((uint32_t)(uintptr_t)shell_task, user_esp);
 }

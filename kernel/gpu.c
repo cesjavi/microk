@@ -271,7 +271,7 @@ void gpu_init() {
                 klog("GPU: NVIDIA BAR0 MMIO successfully mapped.");
                 
                 // Safe read of NV_PMC_BOOT_0
-                volatile uint32_t *pmc_boot_ptr = (volatile uint32_t *)(NVIDIA_BAR0_VMEM + NV_PMC_BOOT_0);
+                volatile uint32_t *pmc_boot_ptr = (volatile uint32_t *)(uintptr_t)(NVIDIA_BAR0_VMEM + NV_PMC_BOOT_0);
                 active_gpu.pmc_boot_0 = *pmc_boot_ptr;
                 
                 // Decode architecture family
