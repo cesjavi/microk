@@ -2,8 +2,18 @@
 #include "pmm.h"
 #include <string.h>
 
-#define HEAP_START 0xC00000 // 12MB
-#define HEAP_SIZE  0x400000 // 4MB
+#define HEAP_START 0xC00000  // 12MB
+/* 4MB was tight even for a tiny model (stories15M): per-token-string
+ * vocab allocation (~900KB-1MB for a 32K-token tokenizer), per-layer KV
+ * cache (which scales with n_layer * n_kv_head, e.g. ~2.8MB for
+ * TinyLlama-1.1B's 22 layers), and the norm-weight copies together can
+ * exceed 4MB well before a 1B-class model's FPU scratch buffers get
+ * allocated -- which surfaced as "LLM: Failed to allocate FPU buffer."
+ * with no other warning. kheap_init() runs before boot_modules_load(),
+ * so PMM reserves whatever size this is before the model buffer gets
+ * placed; bumping it doesn't reduce how much RAM is left for the model
+ * itself by more than the few extra MB reserved here. */
+#define HEAP_SIZE  0x2000000 // 32MB
 #define KHEAP_MAGIC 0x4B484541 // KHEA
 
 typedef struct header {

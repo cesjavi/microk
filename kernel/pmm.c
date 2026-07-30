@@ -15,18 +15,36 @@ static uint32_t high_memory_region_count;
 static uint32_t high_usable_kib;
 static uint32_t high_reserved_kib;
 
+typedef struct {
+    phys_addr_t base;
+    uint32_t blocks;
+    uint32_t first_block_index;
+} high_memory_pool_region_t;
+
 /* High Memory Pool Allocator structures */
-static uint64_t high_pool_start_phys = 0x100000000ULL;
 static uint32_t high_pool_total_blocks = 0;
 static uint32_t high_pool_used_blocks = 0;
 static uint32_t *high_bitmap = 0;
+static high_memory_pool_region_t high_pool_regions[PMM_MAX_MEMORY_REGIONS];
+static uint32_t high_pool_region_count = 0;
 
 static uint32_t align_down(uint32_t value) {
     return value & ~(PAGE_SIZE - 1);
 }
 
 static uint32_t align_up(uint32_t value) {
+    if (value > 0xFFFFFFFFu - (PAGE_SIZE - 1)) {
+        return 0xFFFFFFFFu;
+    }
     return (value + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+}
+
+static phys_addr_t align_up_phys(phys_addr_t value) {
+    return (value + PAGE_SIZE - 1) & ~((phys_addr_t)PAGE_SIZE - 1);
+}
+
+static phys_addr_t align_down_phys(phys_addr_t value) {
+    return value & ~((phys_addr_t)PAGE_SIZE - 1);
 }
 
 static uint32_t capped_add(uint32_t a, uint32_t b) {
@@ -68,6 +86,10 @@ void pmm_reset_memory_regions(void) {
     high_memory_region_count = 0;
     high_usable_kib = 0;
     high_reserved_kib = 0;
+    high_pool_total_blocks = 0;
+    high_pool_used_blocks = 0;
+    high_pool_region_count = 0;
+    high_bitmap = 0;
 }
 
 void pmm_record_memory_region(uint32_t base, uint32_t size, uint32_t type) {
@@ -120,6 +142,23 @@ void pmm_record_high_memory_region(uint32_t base_low, uint32_t base_high, uint32
     high_memory_region_count++;
     if (type == 1) {
         high_usable_kib = capped_add_kib(high_usable_kib, high_kib);
+        phys_addr_t region_base = align_up_phys(high_start);
+        phys_addr_t region_end = align_down_phys(end);
+        if (region_end > region_base && high_pool_region_count < PMM_MAX_MEMORY_REGIONS) {
+            uint64_t blocks64 = (region_end - region_base) / PAGE_SIZE;
+            if (blocks64 > 0) {
+                if (blocks64 > 0xFFFFFFFFULL - high_pool_total_blocks) {
+                    blocks64 = 0xFFFFFFFFULL - high_pool_total_blocks;
+                }
+                high_pool_regions[high_pool_region_count].base = region_base;
+                high_pool_regions[high_pool_region_count].blocks = (uint32_t)blocks64;
+                high_pool_regions[high_pool_region_count].first_block_index = high_pool_total_blocks;
+                high_pool_region_count++;
+                high_pool_total_blocks += (uint32_t)blocks64;
+            }
+        } else if (region_end > region_base) {
+            invalid_memory_region_count++;
+        }
     } else {
         high_reserved_kib = capped_add_kib(high_reserved_kib, high_kib);
     }
@@ -175,12 +214,15 @@ void pmm_unset_block(uint32_t bit) {
 }
 
 void *pmm_alloc_block() {
-    for (uint32_t i = 0; i < max_blocks / 32; i++) {
+    uint32_t num_words = (max_blocks + 31) / 32;
+    for (uint32_t i = 0; i < num_words; i++) {
         if (bitmap[i] != 0xFFFFFFFF) {
             for (int j = 0; j < 32; j++) {
+                uint32_t block = i * 32 + j;
+                if (block >= max_blocks) break;
                 if (!(bitmap[i] & (1 << j))) {
-                    pmm_set_block(i * 32 + j);
-                    return (void *)((i * 32 + j) * PAGE_SIZE);
+                    pmm_set_block(block);
+                    return (void *)(block * PAGE_SIZE);
                 }
             }
         }
@@ -308,10 +350,10 @@ void pmm_get_stats(pmm_stats_t *out) {
     out->high_pool_used_blocks = high_pool_used_blocks;
     out->high_pool_free_blocks = high_pool_total_blocks - high_pool_used_blocks;
     out->high_pool_allocatable = high_bitmap ? 1 : 0;
+    out->high_pool_region_count = high_pool_region_count;
 }
 
 void pmm_init_high(void) {
-    high_pool_total_blocks = high_usable_kib / 4; // 4 KiB per block
     if (high_pool_total_blocks == 0) return;
 
     // Allocate bitmap for high memory blocks
@@ -325,6 +367,33 @@ void pmm_init_high(void) {
         high_bitmap = (uint32_t *)low_block;
         memset(high_bitmap, 0, bitmap_size_bytes);
     }
+}
+
+static phys_addr_t high_block_index_to_phys(uint32_t block_index) {
+    for (uint32_t i = 0; i < high_pool_region_count; i++) {
+        high_memory_pool_region_t *region = &high_pool_regions[i];
+        uint32_t first = region->first_block_index;
+        uint32_t last = first + region->blocks;
+        if (block_index >= first && block_index < last) {
+            return region->base + (phys_addr_t)(block_index - first) * PAGE_SIZE;
+        }
+    }
+    return 0;
+}
+
+static int high_phys_to_block_index(phys_addr_t phys, uint32_t *out_block_index) {
+    if (!out_block_index) return 0;
+
+    for (uint32_t i = 0; i < high_pool_region_count; i++) {
+        high_memory_pool_region_t *region = &high_pool_regions[i];
+        phys_addr_t start = region->base;
+        phys_addr_t end = start + (phys_addr_t)region->blocks * PAGE_SIZE;
+        if (phys >= start && phys < end && ((phys - start) % PAGE_SIZE) == 0) {
+            *out_block_index = region->first_block_index + (uint32_t)((phys - start) / PAGE_SIZE);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 phys_addr_t pmm_alloc_high_block(void) {
@@ -341,7 +410,7 @@ phys_addr_t pmm_alloc_high_block(void) {
                 if (!(high_bitmap[i] & (1 << j))) {
                     high_bitmap[i] |= (1 << j);
                     high_pool_used_blocks++;
-                    return high_pool_start_phys + (uint64_t)block_index * PAGE_SIZE;
+                    return high_block_index_to_phys(block_index);
                 }
             }
         }
@@ -350,10 +419,8 @@ phys_addr_t pmm_alloc_high_block(void) {
 }
 
 void pmm_free_high_block(phys_addr_t phys) {
-    if (!high_bitmap || phys < high_pool_start_phys) return;
-    uint64_t offset = phys - high_pool_start_phys;
-    uint32_t block_index = (uint32_t)(offset / PAGE_SIZE);
-    if (block_index >= high_pool_total_blocks) return;
+    uint32_t block_index;
+    if (!high_bitmap || !high_phys_to_block_index(phys, &block_index)) return;
 
     if (high_bitmap[block_index / 32] & (1 << (block_index % 32))) {
         high_bitmap[block_index / 32] &= ~(1 << (block_index % 32));

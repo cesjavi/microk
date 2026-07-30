@@ -44,6 +44,7 @@ typedef struct {
     uint32_t high_pool_used_blocks;
     uint32_t high_pool_free_blocks;
     uint32_t high_pool_allocatable;
+    uint32_t high_pool_region_count;
 } pmm_stats_t;
 
 void pmm_init(uint32_t mem_size, uint32_t bitmap_start);
