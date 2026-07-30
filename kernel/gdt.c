@@ -22,7 +22,7 @@ void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_
 }
 
 static void write_tss(int num, uint16_t ss0, uint32_t esp0) {
-    uint32_t base = (uint32_t)&tss_entry;
+    uint32_t base = (uint32_t)(uintptr_t)&tss_entry;
     uint32_t limit = sizeof(tss_entry) - 1;
 
     gdt_set_gate(num, base, limit, 0x89, 0x00);
@@ -43,7 +43,7 @@ void tss_set_stack(uint32_t stack) {
 __attribute__((target("no-sse")))
 void gdt_init() {
     gp.limit = (sizeof(struct gdt_entry) * 6) - 1;
-    gp.base  = (uint32_t)&gdt;
+    gp.base  = (uint32_t)(uintptr_t)&gdt;
 
     gdt_set_gate(0, 0, 0, 0, 0);                // Null segment
     gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF); // Code segment (Kernel)
@@ -53,6 +53,6 @@ void gdt_init() {
     
     write_tss(5, 0x10, 0); // TSS Entry
 
-    gdt_flush((uint32_t)&gp);
+    gdt_flush((uint32_t)(uintptr_t)&gp);
     tss_flush();
 }

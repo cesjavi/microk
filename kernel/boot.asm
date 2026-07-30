@@ -22,6 +22,22 @@ _start:
     cli                         ; Disable interrupts
     mov esp, stack_top          ; Setup stack
 
+    ; Enable SSE properly before any C code (compiled with -msse2) or the
+    ; FXSAVE/FXRSTOR pair in interrupts.asm's IRQ/syscall handlers runs.
+    ; CR0.EM=0/MP=1 is what actually gates execution of SSE arithmetic
+    ; instructions (ordinary float math already worked without this, so
+    ; QEMU TCG was likely just not enforcing it) -- but CR4.OSFXSR is what
+    ; specifically governs whether FXSAVE/FXRSTOR are even valid opcodes
+    ; rather than #UD, which is a separate, harder requirement worth
+    ; setting explicitly rather than relying on emulator leniency.
+    mov eax, cr0
+    and eax, 0xFFFFFFFB ; clear EM (bit 2)
+    or  eax, 0x00000002 ; set MP (bit 1)
+    mov cr0, eax
+    mov eax, cr4
+    or  eax, 0x00000600 ; set OSFXSR (bit 9) + OSXMMEXCPT (bit 10)
+    mov cr4, eax
+
     push ebx                    ; Pass multiboot info structure
     push eax                    ; Pass multiboot magic
     call kernel_main            ; Jump to C code
