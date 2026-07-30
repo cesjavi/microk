@@ -28,13 +28,13 @@
 - [x] Elegir y documentar un modelo GGUF tiny soportado inicialmente.
 - [x] Crear fixture GGUF diminuto y target `make qemu-gguf`.
 - [x] Agregar trazas `llm trace on|off|status` para tokens de entrada/salida.
-- [ ] Implementar loader de tensores Llama-like completo.
-- [ ] Implementar RMSNorm, RoPE, softmax y SwiGLU con tests.
+- [x] Implementar loader de tensores Llama-like completo.
+- [x] Implementar RMSNorm, RoPE, softmax y SwiGLU con tests.
 - [ ] Implementar forward pass de una capa contra referencia Python.
-- [x] Habilitar `GENERATIVE-PREVIEW` para primer token cuando el GGUF tenga tensores minimos.
-- [ ] Implementar decoder completo con argmax greedy.
-- [ ] Agregar KV cache para contexto pequeno.
-- [ ] Integrar generacion real en `llm ask`.
+- [x] Habilitar `GENERATIVE` para primer token cuando el GGUF tenga tensores minimos.
+- [x] Implementar decoder completo con argmax greedy.
+- [x] Agregar KV cache para contexto pequeno.
+- [x] Integrar generacion real en `llm ask`.
 
 ## Storage
 
@@ -49,12 +49,12 @@
 - [x] FAT32: subdirectorios 8.3 read-only.
 - [x] Agregar prueba manual documentada de `loadmodel` con imagen FAT32 QEMU.
 - [x] FAT32: nombres largos VFAT ASCII básicos.
-- [ ] FAT32: VFAT Unicode completo y checksum LFN.
+- [x] FAT32: VFAT Unicode completo y checksum LFN (ver ROADMAP.md Fase 4).
 - [x] ext2 read-only inicial: listar root y leer archivos directos.
 - [x] ext2 read-only: subdirectorios y single indirect blocks.
 - [x] ext2 read-only: double/triple indirect blocks.
 - [x] Agregar prueba manual `qemu-ext2` con imagen ext2.
-- [ ] ext2 read-only real: validación amplia y manejo robusto ext3/ext4.
+- [x] ext2 read-only real: validación amplia (ver ROADMAP.md Fase 4). Manejo robusto ext3/ext4 (journal replay, extents) sigue pendiente.
 - [ ] USB storage.
 
 ## Kernel y Estabilidad
@@ -70,15 +70,19 @@
  - [x] Reportar memoria alta detectada por Multiboot en `mem`.
  - [x] Separar stats de pools PMM low/high.
  - [x] Implementar asignacion real desde pool alto.
+ - [x] Hacer el pool alto consciente de regiones reales del mmap.
  - [x] Implementar estructuras PAE y helpers de entradas de 64 bits.
+ - [x] Activar PAE en `vmm_init` con fallback si CPUID no lo soporta.
  - [x] Implementar ventanas temporales de high memory.
+ - [ ] Mover buffers grandes de modelos/cache a high memory.
+ - [ ] Usar RAM >4GB como memoria general del kernel.
  - [x] Syscalls básicas.
  - [x] **Spinlocks/Mutexes**: Sincronización para recursos compartidos (Video/KBD).
  - [x] **Mapeo Seguro de Modelos**: Mover la carga de modelos a regiones reservadas del PMM.
  - [x] **User Mode (Ring 3)**: Base operativa (TSS + iret jump).
  - [x] **Protección de Páginas**: Impedir que Ring 3 acceda a memoria del Kernel.
- - [ ] Scheduler robusto.
- - [ ] Shared memory IPC.
+ - [x] Scheduler robusto.
+ - [x] Shared memory IPC (API estilo SysV shm; ver ROADMAP.md Fase 2).
 
 ## Persistencia e IA Avanzada
 
@@ -89,7 +93,7 @@
 - [x] Tokenizer.
 - [x] Tensor loader.
 - [x] Matmul FP32/int cuantizado.
-- [ ] Network stack.
+- [x] Network stack.
 
 ## NVIDIA / GPU Real
 
@@ -101,6 +105,7 @@
 - [x] Leer registros seguros de identificacion.
 - [ ] Investigar Nouveau para inicializacion y command submission.
 - [ ] Posponer compute NVIDIA hasta tener MMIO, memoria GPU y colas estables.
+- [ ] Planificar backend LLM sobre NVIDIA despues de driver propio de VRAM/colas; no depender de CUDA dentro del kernel.
 
 ## Red / IP Dinamica y Configurable
 
@@ -112,20 +117,22 @@
 - [x] Leer MAC address de e1000.
 - [x] Implementar Ethernet RX/TX basico.
 - [x] Implementar ARP.
-- [ ] Implementar IPv4 + ICMP echo reply.
-- [ ] Implementar `ping <ip>`.
-- [ ] Implementar UDP minimo.
-- [ ] Implementar cliente DHCP Discover/Offer/Request/Ack.
+- [x] Implementar IPv4 + ICMP echo reply.
+- [x] Implementar `ping <ip>`.
+- [x] Implementar UDP minimo.
+- [x] Implementar cliente DHCP Discover/Offer/Request/Ack.
+- [x] Implementar DNS A record resolver + `nslookup <host>`.
 - [x] Agregar `make qemu-net`.
 
 ## LLM Remoto por Red
 
-- [ ] Definir protocolo UDP textual: `PING`, `STATUS`, `INFO`, `ASK <prompt>`.
-- [ ] Implementar servicio UDP stateless para consultar `llm_inference`.
-- [ ] Agregar config de puerto y flag `llm_net_enabled`.
-- [ ] Agregar comandos `llm net on`, `llm net off`, `llm net status`.
-- [ ] Limitar prompt/respuesta a buffers seguros.
-- [ ] Agregar token simple opcional para entorno de laboratorio.
-- [ ] Crear `scripts/llm_udp_client.py`.
-- [ ] Documentar prueba host -> MicroK con `ASK hola`.
+- [x] Definir protocolo UDP textual: `PING`, `STATUS`, `INFO`, `ASK <prompt>`.
+- [x] Implementar servicio UDP stateless para consultar `llm_inference`.
+- [x] Agregar config de puerto y flag `llm_net_enabled`.
+- [x] Agregar comandos `llm net on`, `llm net off`, `llm net status`.
+- [x] Limitar prompt/respuesta a buffers seguros.
+- [x] Agregar token simple opcional para entorno de laboratorio (prefijo <token> en cada request).
+- [x] Crear `scripts/llm_udp_client.py`.
+- [x] Documentar prueba host -> MicroK con `ASK hola` (RDT fix completa el ciclo).
+- [x] Implementar RSH: shell remota UDP en puerto 2323 con token y flag de habilitacion.
 - [ ] Posponer SSH hasta tener TCP, crypto y autenticacion robusta.

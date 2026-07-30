@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include <string.h>
+#include "string.h"
 #include "math.h"
 #include "pmm.h"
 #include "kheap.h"
@@ -44,7 +44,24 @@ enum {
     SYS_LLM_NET_SET = 41,
     SYS_LLM_NET_STATUS_STR = 42,
     SYS_NET_POLL = 43,
-    SYS_LLM_NET_PORT = 44
+    SYS_LLM_NET_PORT = 44,
+    SYS_NET_PING = 45,
+    SYS_NET_DNS_RESOLVE = 46,
+    SYS_LLM_NET_TOKEN   = 47,
+    SYS_RSH_SET         = 48,
+    SYS_RSH_PORT        = 49,
+    SYS_RSH_TOKEN       = 50,
+    SYS_RSH_STATUS_STR  = 51,
+    SYS_LLM_GGUF_SELFTEST = 52,
+    SYS_NET_CONFIG_SAVE = 53,
+    SYS_IPC_SHM_CREATE = 54,
+    SYS_IPC_SHM_ATTACH = 55,
+    SYS_IPC_SHM_DETACH = 56,
+    SYS_IPC_SHM_DESTROY = 57,
+    SYS_IPC_SHM_SELFTEST = 58,
+    SYS_LLM_DUMP_LOGITS = 59,
+    SYS_HBUF_SELFTEST = 60,
+    SYS_USB_STATUS_STR = 61
 };
 
 static inline void syscall_print(const char *msg) {
@@ -163,6 +180,12 @@ static inline void syscall_llm_info_str(char *buf) {
     asm volatile ("int $0x80" : : "a"(SYS_LLM_INFO_STR), "c"(buf) : "memory");
 }
 
+static inline int syscall_llm_gguf_selftest(void) {
+    uint32_t result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_LLM_GGUF_SELFTEST) : "memory");
+    return (int)result;
+}
+
 static inline int syscall_fat_create(const char *path) {
     int result = 0;
     asm volatile ("int $0x80" : : "a"(SYS_FAT_CREATE), "c"(path), "d"(&result) : "memory");
@@ -205,6 +228,22 @@ static inline int syscall_net_config_static(const char *ip, const char *mask, co
     return result;
 }
 
+static inline int syscall_net_config_save(void) {
+    uint32_t result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_NET_CONFIG_SAVE) : "memory");
+    return (int)result;
+}
+
+static inline int syscall_ipc_shm_selftest(void) {
+    uint32_t result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_IPC_SHM_SELFTEST) : "memory");
+    return (int)result;
+}
+
+static inline void syscall_llm_dump_logits(const char *prompt, char *response) {
+    asm volatile ("int $0x80" : : "a"(SYS_LLM_DUMP_LOGITS), "c"(prompt), "d"(response) : "memory");
+}
+
 static inline uint32_t syscall_mem_region_count(void) {
     uint32_t count = 0;
     asm volatile ("int $0x80" : : "a"(SYS_MEM_REGION_COUNT), "c"(&count) : "memory");
@@ -221,6 +260,10 @@ static inline void syscall_gpu_status_str(char *buf) {
     asm volatile ("int $0x80" : : "a"(SYS_GPU_STATUS_STR), "c"(buf) : "memory");
 }
 
+static inline void syscall_usb_status_str(char *buf) {
+    asm volatile ("int $0x80" : : "a"(SYS_USB_STATUS_STR), "c"(buf) : "memory");
+}
+
 static inline void syscall_arp_status_str(char *buf) {
     asm volatile ("int $0x80" : : "a"(SYS_ARP_STATUS_STR), "c"(buf) : "memory");
 }
@@ -228,6 +271,12 @@ static inline void syscall_arp_status_str(char *buf) {
 static inline int syscall_highmem_test(void) {
     int result = 0;
     asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_HIGH_MEM_TEST) : "memory");
+    return result;
+}
+
+static inline int syscall_hbuf_selftest(void) {
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_HBUF_SELFTEST) : "memory");
     return result;
 }
 
@@ -249,6 +298,46 @@ static inline int syscall_llm_net_port(uint16_t port) {
     int result = 0;
     asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_LLM_NET_PORT), "c"((uint32_t)port) : "memory");
     return result;
+}
+
+static inline int syscall_net_ping(const char *ip_str) {
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_NET_PING), "c"(ip_str) : "memory");
+    return result;
+}
+
+static inline int syscall_net_dns_resolve(const char *hostname, uint8_t *out_ip) {
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_NET_DNS_RESOLVE), "c"(hostname), "d"(out_ip) : "memory");
+    return result;
+}
+
+static inline int syscall_llm_net_token(const char *token) {
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_LLM_NET_TOKEN), "c"(token) : "memory");
+    return result;
+}
+
+static inline int syscall_rsh_set(int enabled) {
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_RSH_SET), "c"((uint32_t)enabled) : "memory");
+    return result;
+}
+
+static inline int syscall_rsh_port(uint16_t port) {
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_RSH_PORT), "c"((uint32_t)port) : "memory");
+    return result;
+}
+
+static inline int syscall_rsh_token(const char *token) {
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_RSH_TOKEN), "c"(token) : "memory");
+    return result;
+}
+
+static inline void syscall_rsh_status_str(char *buf) {
+    asm volatile ("int $0x80" : : "a"(SYS_RSH_STATUS_STR), "c"(buf) : "memory");
 }
 
 static char shell_cwd[64] = "";
@@ -443,6 +532,9 @@ static void shell_mem(void) {
     syscall_print("\n");
     syscall_print("  high pool allocatable: ");
     syscall_print(stats.high_pool_allocatable ? "yes\n" : "no\n");
+    syscall_print("  high pool regions: ");
+    shell_print_uint(stats.high_pool_region_count);
+    syscall_print("\n");
     syscall_print("  blocks: used ");
     shell_print_uint(stats.used_blocks);
     syscall_print(" / total ");
@@ -527,6 +619,12 @@ static void shell_gpu_info(void) {
     syscall_print(buf);
 }
 
+static void shell_usb_info(void) {
+    char buf[256];
+    syscall_usb_status_str(buf);
+    syscall_print(buf);
+}
+
 static void shell_arp_info(void) {
     char buf[512];
     syscall_arp_status_str(buf);
@@ -538,6 +636,44 @@ static void shell_run_llm_query(const char *prompt) {
 
     syscall_print("LLM is thinking...\n");
     syscall_llm_query(prompt, response);
+    syscall_print(response);
+    syscall_put_char('\n');
+}
+
+/* Chat-tuned models (e.g. TinyLlama-1.1B-Chat) expect prompts wrapped in
+ * their chat template (<|user|>...</s><|assistant|>); fed plain text they
+ * tend to produce erratic completions. Building the template here avoids
+ * the user having to type '<', '|', '>' at all -- on some keyboard
+ * layouts (e.g. Spanish/Latin American) those require AltGr or sit at a
+ * different scancode position than this kernel's US-only keyboard driver
+ * expects, so they may not be typeable in the QEMU window at all. */
+static void shell_run_llm_chat(const char *prompt) {
+    char wrapped[256];
+    char response[128];
+    const char *prefix = "<|user|>\n";
+    const char *suffix = "</s>\n<|assistant|>\n";
+    uint32_t prefix_len = strlen(prefix);
+    uint32_t suffix_len = strlen(suffix);
+    uint32_t prompt_len = strlen(prompt);
+    uint32_t max_prompt = sizeof(wrapped) - prefix_len - suffix_len - 1;
+
+    if (prompt_len > max_prompt) prompt_len = max_prompt;
+
+    memcpy(wrapped, prefix, prefix_len);
+    memcpy(wrapped + prefix_len, prompt, prompt_len);
+    memcpy(wrapped + prefix_len + prompt_len, suffix, suffix_len + 1);
+
+    syscall_print("LLM is thinking (chat template)...\n");
+    syscall_llm_query(wrapped, response);
+    syscall_print(response);
+    syscall_put_char('\n');
+}
+
+static void shell_run_llm_logits(const char *prompt) {
+    char response[128];
+
+    syscall_print("Computing logits...\n");
+    syscall_llm_dump_logits(prompt, response);
     syscall_print(response);
     syscall_put_char('\n');
 }
@@ -581,8 +717,16 @@ static void shell_llm_net_command(const char *args) {
         } else {
             syscall_print("LLM net UDP port updated.\n");
         }
+    } else if (strstr(args, "token ") == args) {
+        if (syscall_llm_net_token(args + 6)) {
+            if (strcmp(args + 6, "off") == 0) {
+                syscall_print("LLM net auth disabled.\n");
+            } else {
+                syscall_print("LLM net token set.\n");
+            }
+        }
     } else {
-        syscall_print("Usage: llm net on|off|status|port <1-65535>\n");
+        syscall_print("Usage: llm net on|off|status|port <p>|token <t|off>\n");
     }
 }
 
@@ -692,7 +836,7 @@ static void shell_autocomplete(char *line, int *idx) {
     if (plen == 0 && !is_command) return;
 
     if (is_command) {
-        const char *cmds[] = {"help", "clear", "status", "mem", "mem test", "highmemtest", "ls", "cat", "cd", "loadmodel", "llm", 0};
+        const char *cmds[] = {"help", "clear", "status", "mem", "mem test", "highmemtest", "highmemtest buf", "ls", "cat", "cd", "loadmodel", "llm", "usb", 0};
         for (int i = 0; cmds[i]; i++) {
             if (shell_strncasecmp(cmds[i], prefix, plen) == 0) {
                 strncpy(line, cmds[i], 63);
@@ -741,7 +885,7 @@ static void shell_handle_command(char *line) {
         syscall_put_char('\n');
         shell_run_llm_query(line + 1);
     } else if (strcmp(line, "help") == 0) {
-        syscall_print("Commands: help, clear, status, mem, mem map, mem test, highmemtest, heaptest, ls [dir], cat <file>, cd <dir>, loadmodel <file>, extls, extcat <file>, fs, gpu, gpu info, net status, net config dhcp, net config static <ip> <mask> <gw>, arp, llm status, llm info, llm selftest, llm trace on|off|status, llm net on|off|status|port <p>, llm ask <p>, !<p>\n");
+        syscall_print("Commands: help, clear, status, mem, mem map, mem test, highmemtest, highmemtest buf, heaptest, ls [dir], cat <file>, cd <dir>, loadmodel <file>, extls, extcat <file>, fs, gpu, gpu info, net status, net config dhcp, net config static <ip> <mask> <gw>, net config save, ipc shmtest, dhcp renew, arp, ping <ip>, nslookup <host>, rsh on|off|status|port <p>|token <t|off>, llm status, llm info, llm selftest, llm selftest gguf, llm trace on|off|status, llm net on|off|status|port <p>|token <t|off>, llm ask <p>, llm logits <p>, llm chat <p>, usb, !<p>\n");
     } else if (strcmp(line, "ls") == 0) {
         syscall_fat_ls(shell_cwd[0] ? shell_cwd : 0);
     } else if (strstr(line, "ls ") == line) {
@@ -779,20 +923,104 @@ static void shell_handle_command(char *line) {
         syscall_print("Storage: FAT32 (Mounted), Initrd (Mounted).\n");
     } else if (strcmp(line, "gpu") == 0 || strcmp(line, "gpu info") == 0) {
         shell_gpu_info();
+    } else if (strcmp(line, "usb") == 0) {
+        shell_usb_info();
     } else if (strcmp(line, "net status") == 0) {
         char buf[256];
         syscall_net_status_str(buf);
         syscall_print(buf);
-    } else if (strcmp(line, "net config dhcp") == 0) {
+    } else if (strcmp(line, "net config dhcp") == 0 || strcmp(line, "dhcp renew") == 0) {
+        syscall_print("DHCP: sending Discover...\n");
         if (syscall_net_config_dhcp()) {
-            syscall_print("Network mode set to DHCP.\n");
+            char buf[256];
+            syscall_net_status_str(buf);
+            syscall_print("DHCP: lease acquired.\n");
+            syscall_print(buf);
         } else {
-            syscall_print("Failed to set DHCP mode.\n");
+            syscall_print("DHCP: timed out, no offer received.\n");
         }
     } else if (strstr(line, "net config static ") == line) {
         shell_net_config_static(line + 18);
+    } else if (strcmp(line, "net config save") == 0) {
+        if (syscall_net_config_save()) {
+            syscall_print("Network config saved to /net.cfg.\n");
+        } else {
+            syscall_print("Network config save failed (no FAT32 mount or write error).\n");
+        }
+    } else if (strcmp(line, "ipc shmtest") == 0) {
+        if (syscall_ipc_shm_selftest()) {
+            syscall_print("IPC shared memory selftest: PASS (create/attach/write/read/destroy).\n");
+        } else {
+            syscall_print("IPC shared memory selftest: FAIL.\n");
+        }
     } else if (strcmp(line, "arp") == 0 || strcmp(line, "net arp") == 0) {
         shell_arp_info();
+    } else if (strstr(line, "ping ") == line) {
+        const char *ip = line + 5;
+        syscall_print("Pinging ");
+        syscall_print(ip);
+        syscall_print("...\n");
+        int rtt = syscall_net_ping(ip);
+        if (rtt > 0) {
+            char buf[16];
+            itoa(rtt, buf, 10);
+            syscall_print("Reply from ");
+            syscall_print(ip);
+            syscall_print(": time=");
+            syscall_print(buf);
+            syscall_print("ms\n");
+        } else if (rtt == 0) {
+            syscall_print("Request timed out.\n");
+        } else {
+            syscall_print("ping: error (no route or ARP failed)\n");
+        }
+    } else if (strstr(line, "nslookup ") == line) {
+        const char *host = line + 9;
+        uint8_t ip[4] = {0, 0, 0, 0};
+        syscall_print("Resolving ");
+        syscall_print(host);
+        syscall_print("...\n");
+        if (syscall_net_dns_resolve(host, ip)) {
+            char tmp[8];
+            syscall_print(host);
+            syscall_print(" -> ");
+            itoa(ip[0], tmp, 10); syscall_print(tmp); syscall_print(".");
+            itoa(ip[1], tmp, 10); syscall_print(tmp); syscall_print(".");
+            itoa(ip[2], tmp, 10); syscall_print(tmp); syscall_print(".");
+            itoa(ip[3], tmp, 10); syscall_print(tmp); syscall_print("\n");
+        } else {
+            syscall_print("nslookup: could not resolve ");
+            syscall_print(host);
+            syscall_print("\n");
+        }
+    } else if (strstr(line, "rsh ") == line) {
+        const char *args = line + 4;
+        if (strcmp(args, "on") == 0) {
+            syscall_rsh_set(1);
+            syscall_print("Remote shell enabled.\n");
+        } else if (strcmp(args, "off") == 0) {
+            syscall_rsh_set(0);
+            syscall_print("Remote shell disabled.\n");
+        } else if (strcmp(args, "status") == 0) {
+            char buf[192];
+            syscall_rsh_status_str(buf);
+            syscall_print(buf);
+        } else if (strstr(args, "port ") == args) {
+            uint32_t value = 0;
+            const char *p = args + 5;
+            while (*p >= '0' && *p <= '9') { value = value * 10 + (uint32_t)(*p - '0'); p++; }
+            if (*p || value == 0 || value > 65535 || !syscall_rsh_port((uint16_t)value)) {
+                syscall_print("Invalid UDP port.\n");
+            } else {
+                syscall_print("RSH UDP port updated.\n");
+            }
+        } else if (strstr(args, "token ") == args) {
+            if (syscall_rsh_token(args + 6)) {
+                syscall_print(strcmp(args + 6, "off") == 0 ? "RSH auth disabled.\n" : "RSH token set.\n");
+            }
+        } else {
+            syscall_print("Usage: rsh on|off|status|port <p>|token <t|off>\n");
+        }
     } else if (strcmp(line, "llm status") == 0) {
         char buf[256];
         syscall_llm_status_str(buf);
@@ -803,12 +1031,21 @@ static void shell_handle_command(char *line) {
         syscall_print(buf);
     } else if (strcmp(line, "llm selftest") == 0 || strcmp(line, "llm test") == 0) {
         shell_llm_selftest();
+    } else if (strcmp(line, "llm selftest gguf") == 0) {
+        int r = syscall_llm_gguf_selftest();
+        if (r == 0)       syscall_print("GGUF selftest: SKIP (backend is not GGUF-GENERATIVE)\n");
+        else if (r == 1)  syscall_print("GGUF selftest: PASS (tokens generated)\n");
+        else              syscall_print("GGUF selftest: FAIL (forward pass ran but produced 0 usable tokens)\n");
     } else if (strstr(line, "llm trace ") == line) {
         shell_llm_trace_command(line + 10);
     } else if (strstr(line, "llm net ") == line) {
         shell_llm_net_command(line + 8);
     } else if (strstr(line, "llm ask ") == line) {
         shell_run_llm_query(line + 8);
+    } else if (strstr(line, "llm logits ") == line) {
+        shell_run_llm_logits(line + 11);
+    } else if (strstr(line, "llm chat ") == line) {
+        shell_run_llm_chat(line + 9);
     } else if (strstr(line, "touch ") == line) {
         char path[64];
         if (!shell_resolve_path(line + 6, path, sizeof(path))) {
@@ -864,6 +1101,11 @@ static void shell_handle_command(char *line) {
         } else {
             syscall_print("PAE High Memory Verification: FAILED\n");
         }
+    } else if (strcmp(line, "highmemtest buf") == 0) {
+        int r = syscall_hbuf_selftest();
+        if (r == 0)       syscall_print("High-memory buffer selftest: SKIP (no RAM above 4GB on this boot)\n");
+        else if (r == 1)  syscall_print("High-memory buffer selftest: PASS (multi-page alloc/read/write verified)\n");
+        else              syscall_print("High-memory buffer selftest: FAIL\n");
     } else if (strcmp(line, "mathtest") == 0) {
         shell_mathtest();
     } else if (strcmp(line, "heaptest") == 0) {

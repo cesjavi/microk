@@ -8,18 +8,22 @@ QEMU_ACCEL_ARGS = -accel $(QEMU_ACCEL)
 VFIO_HOST ?=
 QEMU_NVIDIA_DEVICE ?= vfio-pci,host=$(VFIO_HOST)
 
-CFLAGS = -m32 -ffreestanding -O3 -Wall -Wextra -fno-stack-protector -fno-pic -msse2 -mfpmath=sse -march=pentium4 -Ilib -ffast-math
+CFLAGS = -m32 -ffreestanding -O3 -Wall -Wextra -fno-stack-protector -fno-pic -mstackrealign -msse2 -mfpmath=sse -march=pentium4 -Ilib -ffast-math
 LDFLAGS = -m elf_i386 -T kernel/linker.ld
 
 KERNEL_BIN = build/kernel.bin
-OBJ = kernel/boot.o kernel/main.o kernel/boot_modules.o kernel/shell.o kernel/gdt.o kernel/idt.o kernel/interrupts.o kernel/timer.o kernel/pmm.o kernel/vmm.o kernel/vmm_pae.o kernel/ipc.o kernel/task.o kernel/syscall.o kernel/keyboard.o kernel/llm.o kernel/llm_gguf.o kernel/tensor.o kernel/tokenizer.o lib/string.o lib/math.o kernel/kheap.o kernel/vfs.o kernel/blockdev.o kernel/ata.o kernel/partition.o kernel/storage.o kernel/extfs.o kernel/ntfs.o kernel/fat32.o kernel/pci.o kernel/gpu.o kernel/net.o kernel/initrd.o kernel/video.o kernel/speaker.o kernel/font.o kernel/serial.o kernel/ai_hooks.o kernel/spinlock.o
+OBJ = kernel/boot.o kernel/main.o kernel/boot_modules.o kernel/shell.o kernel/gdt.o kernel/idt.o kernel/interrupts.o kernel/timer.o kernel/pmm.o kernel/vmm.o kernel/vmm_pae.o kernel/highmem.o kernel/ipc.o kernel/task.o kernel/syscall.o kernel/keyboard.o kernel/llm.o kernel/llm_gguf.o kernel/tensor.o kernel/tokenizer.o lib/string.o lib/math.o kernel/kheap.o kernel/vfs.o kernel/blockdev.o kernel/ata.o kernel/uhci.o kernel/partition.o kernel/storage.o kernel/extfs.o kernel/ntfs.o kernel/fat32.o kernel/pci.o kernel/gpu.o kernel/net.o kernel/initrd.o kernel/video.o kernel/speaker.o kernel/font.o kernel/serial.o kernel/ai_hooks.o kernel/spinlock.o
 
-.PHONY: all test-model clean image-mklm image-gguf image-net image-ext2 qemu qemu-gguf qemu-stories15 qemu-net qemu-nvidia qemu-ext2
+.PHONY: all test-model test-netcfg clean image-mklm image-gguf image-net image-ext2 image-usb qemu qemu-gguf qemu-stories15 qemu-net qemu-nvidia qemu-highmem qemu-ext2 qemu-usb
 
 all: $(KERNEL_BIN)
 
 test-model:
 	$(PYTHON) scripts/test_mklm_model.py
+
+test-netcfg:
+	$(CC) -Wall -Wextra -o build/net_config_parser_test scripts/net_config_parser_test.c
+	./build/net_config_parser_test
 
 lib/%.o: lib/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -44,7 +48,7 @@ $(KERNEL_BIN): $(OBJ)
 	$(LD) $(LDFLAGS) $(OBJ) -o $@
 
 clean:
-	rm -rf build kernel/*.o lib/*.o storage.img storage-ext2.img model.mklm net.cfg
+	rm -rf build kernel/*.o lib/*.o storage.img storage-ext2.img usbstick.img model.mklm net.cfg
 
 image-mklm: $(KERNEL_BIN)
 	$(PYTHON) scripts/make_mklm_model.py model.mklm --name test-model \
@@ -103,6 +107,9 @@ qemu-nvidia: image-mklm
 	test -n "$(VFIO_HOST)" || (echo "Set VFIO_HOST=<pci-bdf>, for example VFIO_HOST=0000:01:00.0"; exit 1)
 	$(QEMU) -kernel build/kernel.bin -drive file=storage.img,format=raw,index=0,media=disk -vga std -m 512M -serial stdio -device $(QEMU_NVIDIA_DEVICE) $(QEMU_ACCEL_ARGS)
 
+qemu-highmem: image-mklm
+	$(QEMU) -kernel build/kernel.bin -drive file=storage.img,format=raw,index=0,media=disk -vga std -m 6G -serial stdio $(QEMU_ACCEL_ARGS)
+
 image-ext2: $(KERNEL_BIN)
 	$(PYTHON) scripts/make_mklm_model.py model.mklm --name ext2-test \
 		--pair "hola=Hola desde un modelo cargado por EXT2." \
@@ -116,3 +123,10 @@ image-ext2: $(KERNEL_BIN)
 
 qemu-ext2: image-ext2
 	$(QEMU) -kernel build/kernel.bin -drive file=storage-ext2.img,format=raw,index=0,media=disk -vga std -m 256M -serial stdio $(QEMU_ACCEL_ARGS)
+
+image-usb: $(KERNEL_BIN)
+	dd if=/dev/zero of=usbstick.img bs=1M count=64
+	mkfs.fat -F 32 usbstick.img
+
+qemu-usb: image-mklm image-usb
+	$(QEMU) -kernel build/kernel.bin -drive file=storage.img,format=raw,index=0,media=disk -usb -drive if=none,format=raw,file=usbstick.img,id=usbstick -device usb-storage,drive=usbstick -vga std -m 256M -serial stdio $(QEMU_ACCEL_ARGS)
