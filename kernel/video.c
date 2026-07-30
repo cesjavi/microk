@@ -2,6 +2,7 @@
 #include "serial.h"
 #include "font.h"
 #include "spinlock.h"
+#include "string.h"
 
 static uint16_t *video_memory = (uint16_t *)0xB8000;
 static int cursor_x = 0;
@@ -75,12 +76,35 @@ static void fb_clear_locked(uint32_t color) {
     }
 }
 
+/* Previously, filling the last character row just cleared the entire
+ * framebuffer and reset the cursor to (0,0) -- losing all prior output
+ * instead of scrolling like a real terminal. Shifts the whole framebuffer
+ * up by one character row (8 pixels) and clears only the newly exposed
+ * bottom row, matching the VGA text-mode path's actual scrolling. */
+static void fb_scroll_locked(uint32_t bg_color) {
+    uint32_t row_bytes = fb_pitch * 8;
+    uint32_t total_bytes = fb_pitch * fb_height;
+    uint8_t *fb_bytes = (uint8_t *)framebuffer;
+
+    if (fb_height <= 8 || row_bytes >= total_bytes) {
+        fb_clear_locked(bg_color);
+        return;
+    }
+
+    memmove(fb_bytes, fb_bytes + row_bytes, total_bytes - row_bytes);
+    for (uint32_t y = fb_height - 8; y < fb_height; y++) {
+        for (uint32_t x = 0; x < fb_width; x++) {
+            fb_putpixel_locked((int)x, (int)y, bg_color);
+        }
+    }
+}
+
 void video_init(multiboot_info_t *mbi) {
     spin_init(&video_lock);
     
     use_framebuffer = 0;
     if (mbi && (mbi->flags & 0x800) && mbi->framebuffer_type == 1) {
-        framebuffer = (uint32_t *)(uint32_t)mbi->framebuffer_addr;
+        framebuffer = (uint32_t *)(uintptr_t)mbi->framebuffer_addr;
         fb_width = mbi->framebuffer_width;
         fb_height = mbi->framebuffer_height;
         fb_pitch = mbi->framebuffer_pitch;
@@ -234,12 +258,11 @@ void video_putc(char c, uint32_t color) {
         cursor_y++;
     }
     
-    if (cursor_y >= rows) {
-        fb_clear_locked(0x00000000);
-        cursor_x = 0;
-        cursor_y = 0;
+    while (cursor_y >= rows) {
+        fb_scroll_locked(0x00000000);
+        cursor_y--;
     }
-    
+
     spin_unlock_irqrestore(&video_lock, flags);
 }
 
