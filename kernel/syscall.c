@@ -389,9 +389,36 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         case 61: // USB (UHCI) Status String
             {
                 extern const char *uhci_status_string(void);
-                if (uptr_ok(arg1, 256)) {
-                    strncpy((char *)arg1, uhci_status_string(), 255);
-                    ((char *)arg1)[255] = '\0';
+                if (uptr_ok(arg1, 512)) {
+                    strncpy((char *)arg1, uhci_status_string(), 511);
+                    ((char *)arg1)[511] = '\0';
+                }
+            }
+            break;
+        case 62: // USB Mass Storage self-test string — arg1=buf(512), arg2=with_write_test(0/1)
+            {
+                extern const char *uhci_msd_test_string(int with_write_test);
+                if (uptr_ok(arg1, 512)) {
+                    strncpy((char *)arg1, uhci_msd_test_string((int)arg2), 511);
+                    ((char *)arg1)[511] = '\0';
+                }
+            }
+            break;
+        case 63: // HTTP GET — arg1=net_http_get_req_t*(host[64]+path[128]+port), arg2=out buf, arg3=out_size
+            {
+                typedef struct {
+                    char host[64];
+                    char path[128];
+                    uint16_t port;
+                } net_http_get_req_t;
+
+                if (uptr_ok(arg1, sizeof(net_http_get_req_t)) && uptr_ok(arg2, arg3)) {
+                    net_http_get_req_t *req = (net_http_get_req_t *)arg1;
+                    req->host[sizeof(req->host) - 1] = '\0';
+                    req->path[sizeof(req->path) - 1] = '\0';
+                    retval = (uint32_t)net_http_get(req->host, req->port, req->path, (char *)arg2, arg3);
+                } else {
+                    retval = (uint32_t)-1;
                 }
             }
             break;

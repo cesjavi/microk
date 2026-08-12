@@ -206,7 +206,7 @@ Se considera alcanzado cuando:
 - [x] Verificado host-side con `scripts/fat32_lfn_verify.c` (reimplementa el mismo algoritmo, standalone, contra los bytes reales de un `storage.img` armado con `mtools`): un archivo `café del día muy largo y con ñ.txt` se decodifica perfecto en UTF-8 y el checksum LFN valida `YES` contra todos los archivos reales.
 - [x] **Verificado end-to-end en QEMU real** (`scripts/test_vfat_unicode.sh` arma el fixture; boot manual con `qemu-system-i386 -kernel build/kernel.bin -initrd stories15M.gguf -drive file=storage.img,format=raw,index=0,media=disk ...` para no pisar el fixture con el target `image-gguf` del Makefile): `ls` muestra `café del día muy largo y con ñ.txt` con tildes/ñ correctos, y `cat caf<TAB>` autocompleta el nombre Unicode y lee el contenido del archivo correctamente — confirma tanto el listado de directorio como la resolución de ruta (`fat32_find_entry_in_dir`) con LFN Unicode real.
 - [x] **ext2 read-only real: validación amplia** - Experimental; `kernel/extfs.c` confiaba en campos del disco sin validar: (1) un `name_len` de entrada de directorio corrupto/malicioso podía exceder lo que `rec_len` reservaba, causando una lectura fuera de los límites del buffer de bloque al copiar/comparar el nombre — agregado `ext_dir_entry_valid()` (valida `rec_len`/`name_len` contra el tamaño del bloque) en los dos loops que recorren directorios (`ext_find_entry_in_dir`, `extfs_ls`); (2) números de bloque corruptos en punteros indirectos podían desbordar `block*block_size` (overflow de `uint32_t`) y terminar leyendo otro offset válido pero incorrecto en silencio — `ext_read_block` ahora rechaza bloques `>= blocks_count`; (3) un `inode_num` corrupto podía producir un índice de grupo arbitrario — `ext_read_group_desc` ahora valida contra la cantidad real de grupos; (4) `ext_mount` ahora rechaza superbloques con `blocks_per_group`/`inodes_per_group`/`blocks_count`/`inodes_count` en cero o `inode_size` fuera de rango sano, en vez de fallar más tarde con una división por cero o una lectura fuera de rango en un lugar menos obvio.
-- [x] **USB Mass Storage — Etapa 0+1 (deteccion e inicializacion de UHCI)** - Experimental; ver "Roadmap USB Mass Storage" mas abajo para detalle y verificacion. Enumeracion de dispositivo, Bulk-Only Transport/SCSI e integracion como `block_device_t` quedan pendientes (Etapa 2-4).
+- [x] **USB Mass Storage — Etapa 0 a 4 completas** (deteccion/init de UHCI, enumeracion, Bulk-Only Transport + SCSI minimo, integracion como `block_device_t`) - Experimental; ver "Roadmap USB Mass Storage" mas abajo para detalle y verificacion. Un pendrive USB en QEMU ya se detecta, enumera, habla SCSI y se monta como FAT32 de solo lectura junto al disco ATA — sin cambios en FAT32/ext2/VFS.
 
 ## Fase 5: Estabilidad y Persistencia (NUEVO FOCO)
 
@@ -272,22 +272,41 @@ y verificables independientemente, igual que ATA/FAT32/ext2/red/NVIDIA.
 - [x] **Bug encontrado y corregido durante la verificacion: el bring-up colgaba el boot entero con un dispositivo USB real conectado**. El delay entre pasos del reset de puerto usaba `timer_get_ticks()` (`uhci_delay_ticks`, por analogia con el resto del kernel), pero `storage_init()` corre **antes** de que el scheduler haga el primer cambio de tarea — las interrupciones recien se habilitan cuando se ejecuta el primer `iret` a Ring 3 con `EFLAGS=0x202` (`kernel/task.c`). Sin el timer avanzando, el busy-wait basado en ticks nunca termina. Sin un dispositivo USB conectado el bug era invisible (`uhci_find_controller` fallaba antes de llegar a ningun delay), lo cual permitio que compilara y bootee "bien" hasta que se probo con `-usb -device usb-storage`. Mismo tipo de trampa que `kernel/ata.c` ya evita: reemplazado por `uhci_io_delay()`, un busy-wait puro de puertos I/O (`inb(0x80)`, el truco clasico de "puerto de diagnostico" para delays sin depender de interrupciones), igual filosofia que `ata_io_wait`.
 - [x] **Verificado en QEMU real** (`make qemu-usb`, agrega `-usb -drive if=none,format=raw,file=usbstick.img,id=usbstick -device usb-storage,drive=usbstick` sobre el target `qemu` existente): (1) sin `-usb`, el boot llega limpio hasta el shell y `usb`/el log de boot reportan "no UHCI controller found" — sin regresion; (2) con `-usb -device usb-storage`, el log de boot muestra `USB: UHCI controller at I/O base 0xC040` y `port 0: device connected, enabled, full-speed`, y el resto del boot (storage, red, carga de LLM, shell) continua sin verse afectado.
 
-#### Etapa 2: Enumeracion de dispositivo (Pendiente)
+#### Etapa 2: Enumeracion de dispositivo (DONE)
 
-Construir una Queue Head + Transfer Descriptors para transferencias de control
-(`SET_ADDRESS`, `GET_DESCRIPTOR`, `SET_CONFIGURATION`) para que el frame list
-efectivamente programe trabajo — esta etapa solo lo deja en terminate/vacio.
+- [x] **Motor de transferencias de control (Queue Head + Transfer Descriptors)** - Experimental; una sola QH estatica (`uhci.ctrl->qh`) enlazada en las 1024 entradas del frame list (Etapa 0+1 las dejaba todas en terminate), mas un pool de hasta 32 TDs y un buffer de 256 bytes, todo en una unica pagina de `pmm_alloc_block()`. `uhci_control_transfer()` arma Setup/Data/Status como submits separados contra la misma QH (evita depender de la semantica de "corte automatico del HC ante short packet" dentro de una cadena larga) y `uhci_run_phase()` sondea cada TD hasta que `Active` se limpia, con `SPD` habilitado en las fases IN para que pedir mas bytes que los que un descriptor realmente tiene no cuente como error.
+- [x] **`SET_ADDRESS`/`GET_DESCRIPTOR`/`SET_CONFIGURATION`** - Experimental; `uhci_enumerate_port()` lee 8 bytes del device descriptor con max-packet=8 (minimo universal del endpoint 0 por spec) para aprender el `bMaxPacketSize0` real, asigna direccion `port+1` (sin soporte de hubs), relee el device descriptor completo, pide el config descriptor (primero el header de 9 bytes para `wTotalLength`, despues completo) y hace `SET_CONFIGURATION`. `uhci_parse_config_descriptor()` extrae clase/subclase/protocolo de interfaz y los endpoints bulk IN/OUT (direccion + `wMaxPacketSize`) para dejarlos listos para Bulk-Only Transport (Etapa 3).
+- [x] **Bug encontrado y corregido: timeout de TD basado en iteraciones de CPU, no en tiempo real** - El primer intento media el timeout de cada TD con un contador fijo de iteraciones de `inb(0x80)` (mismo orden de magnitud que los delays de reset de puerto de Etapa 0+1). Bajo TCG a velocidad nativa esas iteraciones terminan en muchisimo menos de 1ms real, mientras que el contador de frames del propio controlador (`FRNUM`) solo avanza con el timer interno de 1ms de QEMU — el resultado era un timeout instantaneo con el TD ni siquiera tocado por el HC. Fix: `uhci_run_phase()`/`uhci_delay_frames()` ahora sondean `FRNUM` directamente (`uhci_frnum()`) para medir tiempo real transcurrido en vez de contar iteraciones de CPU.
+- [x] **Bug encontrado y corregido: falta `Bus Master Enable` en el registro de comando PCI del controlador** - El bring-up de Etapa 0+1 nunca tocaba el PCI Command register de la UHCI; los accesos a puertos I/O (PORTSC, USBCMD, etc.) funcionaban igual porque son I/O directo, pero las lecturas/escrituras DMA del propio HC sobre el frame list/QH/TD (que es como real y unicamente puede tocar la RAM del sistema) dependen del bit Bus Master Enable (PCI Command, bit 2). Sin el, era indistinguible de "el HC nunca procesa nada" desde el lado del kernel. Fix: `uhci_find_controller()` ahora hace `command |= 0x0005` (I/O Space Enable + Bus Master Enable) sobre el PCI Command register al encontrar el controlador, mismo patron que `kernel/net.c` ya usa para el BAR MMIO del e1000.
+- [x] **Bug encontrado y corregido (causa raiz real, no el de Bus Master de arriba): estructuras QH/TD sin `volatile`** - Incluso con Bus Master Enable corregido, el primer TD seguia sin completarse nunca — `FRNUM` avanzaba con normalidad (confirmando que el HC estaba corriendo) pero `td->status` se veia congelado en el valor inicial indefinidamente. Instrumentacion con `-trace 'usb_uhci_*'` de QEMU confirmo que la QH SI se cargaba cada frame (miles de `usb_uhci_qh_load`), pero nunca tomaba la rama "con elementos" — es decir, el HC nunca veia el `qh.element` que el kernel escribia. Causa real: `uhci_qh_t`/`uhci_td_t` declaraban sus campos como `uint32_t` planos; sin `volatile`, GCC (`-O3`) no tiene forma de saber que esa memoria cambia por DMA externo del hardware y puede cachear/no-recargar una lectura que a simple vista nunca se modifica en el codigo visible — el loop de polling podia quedarse leyendo un valor de registro obsoleto para siempre. `FRNUM` nunca mostro el sintoma porque se lee via `inw()` (`asm volatile`), lo cual desvio la sospecha inicial hacia un problema de DMA/bus-mastering en vez de aliasing del compilador. Fix: los 6 campos de `uhci_qh_t`/`uhci_td_t` ahora son `volatile uint32_t`.
+- [x] **Verificado en QEMU real** (`make qemu-usb`): con `-usb -device usb-storage,drive=usbstick`, el log de boot ahora muestra enumeracion completa — `addr 1, VID:PID 0x46F4:0x0001, class 0x00/0x00/0x00`, `configured, interface class 0x08/0x06/0x50 (mass storage)` (0x08=Mass Storage, 0x06=SCSI transparente, 0x50=Bulk-Only Transport, exactamente lo esperado de `usb-storage` de QEMU) y `bulk IN ep1 (mps 0040), bulk OUT ep2 (mps 0040)`. Sin `-usb`, el boot sigue reportando "no UHCI controller found" sin regresion, y el resto del boot (storage, red, LLM, shell) no se ve afectado en ningun caso.
 
-#### Etapa 3: Bulk-Only Transport + SCSI minimo (Pendiente)
+#### Etapa 3: Bulk-Only Transport + SCSI minimo (DONE)
 
-CBW/CSW y el subconjunto minimo de SCSI (`INQUIRY`, `READ CAPACITY(10)`,
-`READ(10)`, `WRITE(10)`, `TEST UNIT READY`).
+- [x] **Transferencias bulk sobre UHCI** - Experimental; `uhci_bulk_transfer()` reutiliza la misma QH/pool de TDs de las transferencias de control (Etapa 2) — este driver nunca tiene control y bulk en vuelo a la vez, así que una segunda QH/entrada de frame list habría sido complejidad sin uso. El pool de TDs se subió de 32 a 64 (`UHCI_CTRL_MAX_TD`) para cubrir hasta 4KB (8 sectores de 512 bytes al max-packet bulk full-speed de 64 bytes) en una sola cadena. El toggle de datos (DATA0/DATA1) es persistente por pipe (`dev->bulk_in_toggle`/`bulk_out_toggle`, reseteado a 0 en `SET_CONFIGURATION` como exige el spec) y se ajusta correctamente incluso si la cadena termina antes de tiempo (`uhci_run_phase` ahora devuelve cuántos TDs completaron realmente vía `out_done`, no solo cuántos se pidieron).
+- [x] **CBW/CSW (Bulk-Only Transport)** - Experimental; `uhci_msd_command()` arma el Command Block Wrapper de 31 bytes (firma `USBC`, tag incremental, `dCBWDataTransferLength`, flags de dirección, CDB de hasta 16 bytes), hace la fase de datos opcional por el pipe bulk correspondiente, y valida el Command Status Wrapper de 13 bytes (firma `USBS`, tag que debe coincidir, `bCSWStatus`).
+- [x] **`TEST UNIT READY`, `INQUIRY`, `READ CAPACITY(10)`, `READ(10)`, `WRITE(10)`** - Experimental; wrappers finos sobre `uhci_msd_command()` que arman el CDB de 6/10 bytes correspondiente. `READ(10)`/`WRITE(10)` heredan el límite de una sola cadena de `uhci_bulk_transfer` (hasta 8 sectores de 512 bytes por llamada) — suficiente para esta etapa de verificación, la integración real como `block_device_t` (Etapa 4) decidirá si hace falta trocear transferencias más grandes en múltiples llamadas.
+- [x] **Comando de shell `usb msdtest`** (solo lectura: INQUIRY + TEST UNIT READY + READ CAPACITY(10) + READ(10) LBA 0) **y `usb msdwritetest`** (agrega un roundtrip WRITE(10)+READ(10) en un LBA de scratch, 100) - Experimental; syscall 62 (`SYS_USB_MSD_TEST_STR`), mismo patrón que la syscall 61 de `usb`. El test de escritura queda deliberadamente separado del de solo-lectura y no se ejecuta nunca automáticamente — a diferencia de la enumeración (Etapa 2), que es puramente diagnóstica, `WRITE(10)` modifica el medio de verdad, y correrlo sin que el usuario lo pida explícitamente sería riesgoso si algún dia se prueba contra un pendrive real en vez de `usbstick.img`.
+- [x] **Diagnóstico de solo lectura automático en el boot** - `storage_init()` ahora también loguea `uhci_msd_test_string(0)` (solo lectura) justo después del status de enumeración, mismo criterio que ya se usaba para no exigir el comando `usb` para ver si hay controlador — sin dispositivo de almacenamiento presente, imprime una sola línea y sigue sin afectar el resto del boot.
+- [x] **Bug encontrado y corregido de paso (no de esta etapa): el `usb` interactivo truncaba la salida a 255 bytes** - `uhci_status_buf` se había ampliado a 512 bytes al agregar el detalle de dispositivo enumerado en Etapa 2, pero la syscall 61 y el buffer del lado shell seguían fijos en 256 — invisible en el log de boot (que llama a `klog(uhci_status_string())` directo, sin pasar por la syscall) pero el comando interactivo `usb` sí lo hubiera mostrado cortado para un dispositivo mass-storage real. Buffers y `uptr_ok`/`strncpy` de la syscall subidos a 512 en `kernel/shell.c`/`kernel/syscall.c`.
+- [x] **Verificado en QEMU real** (`make qemu-usb`): el log de boot ahora muestra, inmediatamente después del status de enumeración — `USB MSD: INQUIRY ok, vendor='QEMU' product='QEMU HARDDISK'`, `USB MSD: TEST UNIT READY ready`, `USB MSD: capacity 0x00020000 blocks x 0x00000200 bytes` (65536 sectores × 512 bytes = 64MB, coincide exacto con `usbstick.img`), y `USB MSD: READ(10) LBA 0 ok, first 16 bytes: EB 58 90 6D 6B 66 73 2E 66 61 74 00 02 01 20 00` — el string ASCII `mkfs.fat` visible en el OEM name del boot sector confirma que son bytes reales leídos del disco, no basura. Habilitando temporalmente el test de escritura se confirmó ademas `USB MSD: WRITE(10)+READ(10) roundtrip verified at LBA 0x64`. Sin `-usb`, el boot no se ve afectado (mismo comportamiento que Etapa 2).
 
-#### Etapa 4: Integracion como `block_device_t` (Pendiente)
+#### Etapa 4: Integracion como `block_device_t` (DONE)
 
-Envolver el dispositivo USB como `block_device_t` y registrarlo con
-`blockdev_register()` para que `partition_scan_mbr`/`vfs_mount` lo detecten con
-cero cambios en FAT32/ext2 — igual que `ata_primary_master()` hoy.
+- [x] **`uhci_msd_block_read`/`uhci_msd_block_write` + `uhci_msd_init`/`uhci_msd_primary`** - Experimental; misma forma exacta que `ata_block_read`/`ata_block_write`/`ata_primary_master` en `kernel/ata.c` — offset/size en bytes, traducidos a LBA + sector-offset internamente, un sector SCSI por llamada (no se usa la capacidad de `uhci_bulk_transfer` de encadenar hasta 8 sectores en una sola transferencia BOT; esta etapa pedía correctitud, no rendimiento, y así se reutiliza tal cual el manejo ya probado de escritura parcial read-modify-write de `ata_block_write`). `uhci_msd_init()` corre `READ CAPACITY(10)` una vez para poblar `block_size`/`block_count` del `block_device_t` (capado a 4KB de tamaño de bloque como guarda defensiva) y guarda el `uhci_device_t*` real en `driver_data` para que los callbacks de lectura/escritura sepan a qué dirección/endpoints/toggle hablarle.
+- [x] **Registro en `storage_init()`** - `kernel/storage.c` ahora llama `uhci_msd_init()` + `blockdev_register()` + `partition_scan_mbr()` inmediatamente después del diagnóstico de Etapa 3, mismo patrón que el bloque de ATA que ya existía — sin ningún cambio en `fat32.c`/`extfs.c`/`partition.c`, que no tienen idea de que el `block_device_t` que reciben es USB en vez de ATA.
+- [x] **Verificado en QEMU real** (`make qemu-usb`): el log de boot ahora muestra, ademas del diagnóstico SCSI de Etapa 3, `Storage: USB mass-storage device detected.` y `Storage: no MBR/GPT partitions found on USB device.` (el `usbstick.img` de prueba está formateado directo con `mkfs.fat`, sin tabla de particiones, igual que `storage.img`); el loop generico de montaje de `storage_init()` (`for i in blockdev_count(): vfs_mount(...)`) imprime `Storage: filesystem mounted read-only. / fat32` **dos veces** — una por cada `block_device_t` registrado (ATA y USB) — confirmando que `fat32_probe`/`fat32_mount` reconocen el dispositivo USB sin cambios de código. Sin `-usb`, el boot es identico a antes (una sola vez, solo ATA).
+- [x] **Limitación conocida, preexistente, no introducida por esta etapa**: `kernel/fat32.c` guarda el estado de montaje FAT32 activo en un único puntero global (`global_fat32_mount`), no una tabla por dispositivo — cuando hay dos `block_device_t` con FAT32 montados (ATA + USB), el último `vfs_mount()` de la lista "gana" y es el que usan `ls`/`cat`/`loadmodel`. `storage_init()` registra/monta USB *antes* que ATA a propósito, así que ATA (el disco de la demo, con `model.mklm`) sigue siendo el activo — pero esto depende del orden de llamadas, no es un diseño multi-mount real. Habilitar acceso simultáneo a ambos dispositivos vía shell (ej. `ls usb:/`) sería trabajo nuevo de VFS, fuera del alcance de "cero cambios en FAT32/ext2" que pedía esta etapa.
+
+#### Criterio de listo — ALCANZADO
+
+- [x] `make qemu-usb` levanta MicroK con un controlador UHCI y un dispositivo `usb-storage` visibles.
+- [x] `usb` (o el log de boot) muestra puerto conectado/habilitado, VID:PID, clase de interfaz y endpoints bulk.
+- [x] `usb msdtest` (tambien automatico en el boot, solo lectura) corre INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10) contra el dispositivo real.
+- [x] `usb msdwritetest` prueba WRITE(10) con un roundtrip verificado en un LBA de scratch.
+- [x] El dispositivo USB aparece como `block_device_t` y `partition_scan_mbr`/`vfs_mount` lo reconocen (FAT32) sin cambios en el filesystem layer.
+- [x] Sin `-usb`, el boot y el resto del stack de storage/red/LLM no se ven afectados en ningun punto de las 4 etapas.
+- [ ] Enumeracion de mas de un dispositivo simultaneo y acceso concurrente a ambos mounts FAT32 vía shell — no pedido por el roadmap original, ver limitación de `global_fat32_mount` arriba.
 
 ### Roadmap NVIDIA
 
@@ -380,11 +399,15 @@ usuario para entornos simples y pruebas reproducibles.
 - [x] Reintentos con timeout y fallback a config estatica si existe.
 - [x] Comando `dhcp renew`.
 
-#### Etapa 6: DNS y utilidades
+#### Etapa 6: DNS y utilidades (DONE)
 
 - [x] Resolver DNS A record basico.
 - [x] Agregar `nslookup <host>`.
-- [ ] Preparar base para HTTP simple o descarga de modelos (requiere TCP).
+- [x] **Preparar base para HTTP simple o descarga de modelos (requiere TCP)** - Experimental; cliente TCP minimo de una sola conexion (`kernel/net.c`, seccion "TCP client"), suficiente para hacer un GET HTTP/1.0 bloqueante — no es una API de sockets general. `net_send_tcp_segment()`/`net_handle_tcp()` implementan el handshake de 3 vias, envio/recepcion de datos y cierre activo (FIN/ACK, sin TIME_WAIT); checksum con pseudo-header via `net_checksum16_partial`/`net_checksum16_finish` (a diferencia de UDP, el checksum de TCP es obligatorio, no opcional). `net_http_get(host, port, path, out, out_size)` resuelve el host (reusa `net_dns_resolve`, acepta IPs dotted-quad directo), conecta, manda `GET <path> HTTP/1.0\r\nHost: <host>\r\nConnection: close\r\n\r\n`, y copia la respuesta cruda (headers+body, sin parsear) hasta que el servidor cierra o el buffer se llena. Expuesto por el comando de shell `http get <host> <path>` (puerto 80 fijo desde el shell; la syscall 63 sí permite puerto arbitrario) via un struct de pedido con strings de tamaño fijo (`host[64]`+`path[128]`) en vez de punteros anidados, para que la syscall solo necesite validar una región contigua de memoria de usuario.
+- [x] **Bug encontrado y corregido: timeout de conexion TCP colgaba el boot para siempre** - El primer intento de verificacion invocaba `net_http_get()` directamente desde `main()` antes de `task_create(net_poll_task)`/`jump_usermode()` — exactamente la misma trampa que ya se documento para UHCI en el roadmap de USB: `timer_get_ticks()` no avanza hasta que la primera IRET a Ring 3 habilita interrupciones, asi que cualquier `while (timer_get_ticks() < deadline) { ... }` corrido antes de eso jamas termina. Fix: la verificacion se movio a correr dentro de `net_poll_task()` (que ya corre correctamente post-scheduler), sin cambio en el diseño de `net_http_get()` en si.
+- [x] **Bug encontrado y corregido: el anillo RX del e1000 se atascaba permanentemente despues del primer paquete no-ARP** - Con el bug resuelto arriba, la conexion TCP seguia fallando (rc=-2, timeout de handshake) a pesar de que capturas de paquete (`-object filter-dump`) confirmaban que QEMU/SLIRP respondia con un SYN-ACK valido. Instrumentacion con `-trace 'e1000_receiver_overrun,e1000x_rx_*'` revelo `Receiver overrun: dropped packet of 60 bytes, RDH=1, RDT=1` — el modelo e1000 de QEMU (`hw/net/e1000.c`, `e1000_has_rxbufs`) trata `RDH == RDT` como "cero descriptores disponibles" para paquetes cortos. El codigo existente escribia `RDT` con el indice *post-incremento* de `e1000_rx_cur` al liberar un descriptor — pero el propio `RDH` de hardware avanza a ese mismo indice apenas termina de entregar un paquete, asi que la primera vez que software libera un descriptor, `RDH` y `RDT` quedan exactamente iguales: un atasco permanente, no solo un anillo con capacidad reducida (nada vuelve a mover `RDT` una vez atascado, asi que ningun paquete posterior es aceptado nunca mas). Coincide con el "remaining bug... may still time out" que el README ya documentaba para el smoke test UDP, y contradice el checkbox "e1000 RDT ring fix" marcado [x] en la Etapa 7 de LLM remoto mas abajo — ese fix anterior aparentemente no resolvio el caso general. Fix real: escribir `RDT` con el indice *pre-incremento* (el descriptor recien liberado), no el post-incremento — preserva el mismo invariante que el `RDT = E1000_RX_DESC_COUNT - 1` de la inicializacion del anillo (con `RDH = 0`) en cada paquete subsiguiente, en vez de colapsarlo despues del primero.
+- [x] **Bug encontrado y corregido: el padding minimo de Ethernet se contaba como payload real de TCP** - Incluso con el fix del anillo RX, el stream TCP llegaba corrompido — logueando byte a byte se veia el primer segmento (un ACK puro del handshake, sin datos) reportando `payload_len=6` en vez de `0`, lo cual desincronizaba el tracking de numero de secuencia para el resto de la conexion. Causa: Ethernet exige un frame minimo de 60 bytes, así que cualquier payload real mas corto llega paddeado con ceros; `net_handle_packet()` calculaba `ip_payload_len` como los bytes crudos restantes del frame (incluyendo ese padding) en vez de usar el largo total declarado por el propio header IP. UDP ya evita este problema porque tiene su propio campo `udp->len` autodescriptivo (usado en vez del largo crudo); TCP no tiene un campo asi y depende enteramente del header IP para saber su tamaño real, igual que ICMP. Fix: `net_handle_packet()` ahora recorta `ip_payload_len` al valor declarado en `ip->len` (menos el header IP) cuando ese valor es mas chico que los bytes crudos del frame, beneficiando a ICMP y TCP por igual.
+- [x] **Verificado en QEMU real** (`make qemu-net`-style boot, `-netdev user,id=net0 -device e1000,netdev=net0`, con un `python3 -m http.server 8000` corriendo en el host WSL): un GET temporal a `10.0.2.2:8000` — SLIRP expone el propio host de QEMU en esa IP — devolvio la respuesta HTTP/1.0 completa y correcta (`HTTP/1.0 200 OK`, headers, y el cuerpo real `hello from microk test server`), confirmando handshake, transferencia de datos multi-paquete, y cierre limpio end-to-end. Sin regresiones: boot completo hasta el shell con red estatica/DHCP configurada sigue funcionando, y el flujo de `make qemu-usb` (no relacionado, pero comparte `storage_init()`) tampoco se vio afectado.
 
 #### Etapa 7: Servicio remoto directo al LLM
 
@@ -393,7 +416,7 @@ servicio LLM por red. SSH queda para una etapa posterior porque requiere TCP
 robusto, criptografia, claves, random seguro y autenticacion madura.
 
 - [x] Definir protocolo textual minimo: `PING`, `STATUS`, `INFO`, `ASK <prompt>`.
-- [x] Implementar servicio UDP stateless para `llm ask` end-to-end; e1000 RDT ring fix + net_send_udp() completan el ciclo RX→handler→TX.
+- [x] Implementar servicio UDP stateless para `llm ask` end-to-end; e1000 RDT ring fix + net_send_udp() completan el ciclo RX→handler→TX. **Nota agregada luego (Etapa 6 de Red, TCP/HTTP)**: este fix de RDT resolvia el caso puntual probado en su momento, pero el invariante general seguia roto — cualquier paquete no-ARP recibido *despues* del primero quedaba atascado permanentemente (`RDH == RDT`). Probablemente causaba los timeouts intermitentes de UDP que el README documentaba como pendientes. Fix definitivo (escribir `RDT` con el indice pre-incremento) en la seccion de TCP/HTTP mas abajo.
 - [x] Agregar puerto configurable para el servicio LLM.
 - [x] Limitar tamano de prompt y respuesta para evitar overflow.
 - [x] Agregar token simple opcional para laboratorio: prefijo `<token> <cmd>` en cada request.
@@ -418,6 +441,169 @@ robusto, criptografia, claves, random seguro y autenticacion madura.
 - [x] Sin DHCP, MicroK usa `/microk/net.cfg` o config manual.
 - [x] `ping <gateway>` responde en QEMU.
 - [x] Un cliente UDP externo puede enviar `ASK <prompt>` y recibir respuesta del LLM.
+
+### Roadmap de Arranque en Hardware Real
+
+Objetivo: que MicroK pueda arrancar en una PC real (no solo QEMU) y llegar al
+shell interactivo, con storage/red operativos si el hardware especifico lo
+permite. Hoy todo el desarrollo y testing es QEMU-first — README/ROADMAP ya
+documentan por que: el driver stack actual asume hardware que QEMU emula pero
+que las PCs reales dejaron de traer hace mucho (`UHCI` en vez de
+OHCI/EHCI/xHCI, `ATA PIO` en vez de AHCI/NVMe, `Intel e1000` en vez de
+chipsets de red modernos), mas un boot solo-BIOS/CSM sin path UEFI nativo. Este
+no es un fix incremental: cada etapa de abajo es, en tamaño, comparable a un
+driver stack nuevo entero (USB o red lo fueron), y a diferencia de esos casos
+no hay forma de verificar en QEMU si el fix realmente sirve en hardware real —
+cada etapa que toque hardware real necesita acceso a una maquina fisica para
+confirmarse, no solo revisar que compile. Por eso se aborda en etapas chicas,
+cada una con su propio criterio de verificacion, igual que USB/red/NVIDIA.
+
+#### Etapa 0: Auditoria y decisiones previas (Pendiente)
+
+**Nota: VirtualBox como paso intermedio antes de hardware real.** A
+diferencia de QEMU, VirtualBox no tiene un equivalente al flag `-kernel` —
+necesita un medio booteable (ISO/disco virtual) con GRUB instalado
+cadeneando al kernel Multiboot v1, exactamente el mismo mecanismo que la
+Etapa 1 describe para una PC real. Ademas su hardware virtual difiere de
+QEMU justo en los puntos que le importan a este roadmap: soporta un
+controlador IDE PIIX3/PIIX4 (no solo AHCI/SATA, asi que `kernel/ata.c` PIO
+tiene chance real de andar tal cual) y emula explicitamente la familia
+Intel PRO/1000 (82540EM/82545EM, es decir e1000 — el driver actual podria
+funcionar sin cambios). Para USB en cambio VirtualBox solo emula
+OHCI/EHCI/xHCI, nunca UHCI, asi que sirve como prueba negativa gratis: el
+driver actual no va a encontrar nada, igual que en una PC real, sin
+necesitar hardware fisico para confirmarlo. En resumen: boot, storage y red
+tienen buena chance de andar en VirtualBox sin escribir codigo nuevo; USB
+no, y probarlo ahi ya valida ese gap antes de conseguir hardware real.
+
+- [x] **Probar el boot (Etapa 1, GRUB + Multiboot v1 en un medio booteable) en VirtualBox primero** - Verificado; ver bloque de hallazgos abajo. `make iso` (nuevo target, Makefile) genera un ISO GRUB2 rescue booteable (`grub-mkrescue`, requiere `grub-pc-bin`+`xorriso`) que arranca MicroK en VirtualBox vía CSM/BIOS legado real, sin usar el atajo `-kernel` de QEMU.
+- [x] **Con esa VM, probar el controlador IDE (PIIX3/PIIX4)** - Verificado; `kernel/ata.c` funciona sin cambios contra el controlador IDE PIIX de VirtualBox, con una condición: el disco debe estar en un **controlador IDE**, no en el SATA/AHCI que VirtualBox usa por default para discos nuevos (`ata.c` es PIO puro sobre `0x1F0`, no habla AHCI). El adaptador de red Intel PRO/1000 (`kernel/net.c`) todavía no se probó en esta VM.
+- [ ] Probar el adaptador de red Intel PRO/1000 (`kernel/net.c`) en esta misma VM — pendiente, no se llegó a probar en esta sesión.
+
+**Hallazgos de la primera verificación real en VirtualBox (`microk` VM, Base Memory variable, GRUB via `make iso`):**
+
+- [x] **Bug encontrado y corregido: GRUB no puede negociar el modo de video VBE pedido por el header Multiboot, aborta el boot entero** - `kernel/boot.asm` pedía un framebuffer lineal 800x600x32 vía el bit GRAPHICS del header Multiboot v1 (`flags=0x00000007`). Bajo QEMU esto lo maneja el loader `-kernel` propio de QEMU sin problema, pero GRUB real (probado con Graphics Controller tanto VMSVGA como VBoxVGA en VirtualBox) falla con `error: unsupported graphical mode type <valor basura>` al intentar leer el bloque de info de modo VBE vía BIOS — un bug conocido de la interacción GRUB/VBE en VirtualBox, no algo especifico de este kernel. El error aborta el comando `multiboot` sin cargar nada, y el `boot` posterior falla con `error: you need to load the kernel first`. Fix: `MICROK_NO_VIDEO_MODE` (define de nasm, `kernel/boot.asm`) quita el bit GRAPHICS del header cuando se define, sin tocar el build normal. Como `kernel/video.c` ya hacia fallback a VGA texto cuando `mbi->flags` no trae framebuffer info (bit usado para VBE control info, no confundir con el bit de framebuffer real — ver siguiente item de camino a verificar mas a fondo), este build alternativo simplemente nunca pide el modo grafico y bootea directo a VGA texto. Nuevo target `make iso` en el Makefile compila esta variante (`kernel/boot_bios.o` -> `build/kernel-bios.bin`) separada del `build/kernel.bin` normal que siguen usando los targets `qemu-*` (sin cambios, sin regresion).
+- [x] **Bug encontrado y corregido: PS/2 typematic (auto-repeat) del controlador dejaba varios caracteres por una sola pulsacion** - `kernel/keyboard.c` seteaba `last_char` en cada scancode de "make" sin ningun debounce, dependiendo por completo del ritmo de auto-repeat propio del hardware PS/2 para no inundar el buffer de linea del shell. El valor por default del controlador (potencialmente ~30Hz tras solo 250ms de delay) nunca fue un problema bajo QEMU (los tests de entrada eran pulsaciones cortas y discretas), pero una pulsacion humana normal bajo la emulacion PS/2 de VirtualBox alcanzaba a generar varios repeats antes de soltar la tecla (ej. `s` -> `ssss`). Fix: `keyboard_init()` (`kernel/keyboard.c`) ahora manda el comando `0xF3` (Set Typematic Rate/Delay) con el byte `0x7F` (rate mas lento ~2Hz, delay mas largo 1000ms) al dispositivo PS/2 al boot, sondeado directamente sin depender de IRQs (mismo razonamiento que las trampas de `timer_get_ticks()` ya documentadas para UHCI/red: a esta altura del boot las interrupciones todavia no estan habilitadas globalmente).
+- [x] **Hallazgo (no bug de este kernel): un disco nuevo agregado al controlador SATA por default de VirtualBox no es visible para `ata.c`** - Al adjuntar el disco de storage (`storage.img`, convertido a `.vdi` via `VBoxManage convertfromraw`) al controlador SATA que VirtualBox crea por default, `storage_init()` no lo detecta (`Failed to load model from FAT32/EXT.`, `FAT32 filesystem not mounted.`) porque `ata.c` es PIO puro sobre los puertos IDE legacy (`0x1F0`), no AHCI. Coincide exactamente con el gap ya anticipado en la Etapa 4 de este mismo roadmap ("Storage AHCI minimo — Pendiente"). Solucion (config de VM, no de codigo): agregar un controlador **IDE** en Settings -> Storage y adjuntar el disco ahi como Primary Master en vez de en SATA.
+- [x] **Hallazgo (no bug de este kernel): agregar el disco IDE cambio el Boot Device Order de la VM y el BIOS intento bootear directo del disco** - Con "Disco duro" agregado por encima de "Optica" en Settings -> System -> Boot Order, el BIOS bootea el sector de arranque de `storage.img` en vez de la ISO de GRUB. Como `storage.img` solo tiene `mkfs.fat` corrido (sin bootloader instalado), el BIOS ejecuta bytes de la cabecera FAT32 como si fueran codigo x86 real — el resultado es pantalla completa de caracteres/colores aleatorios (llamadas de video BIOS dispersas por casualidad dentro de codigo basura), facilmente confundible con corrupcion de memoria del kernel pero en realidad nunca se llego a ejecutar el kernel. Solucion (config de VM): desmarcar "Disco duro" del Boot Device Order o dejar solo "Optica" marcada — el disco IDE sigue siendo visible para `ata.c` en tiempo de ejecucion sin estar en el boot order del BIOS, son mecanismos independientes.
+- [x] **Hallazgo: lecturas ATA PIO sector-por-sector son ordenes de magnitud mas lentas bajo VT-x que bajo QEMU TCG** - `ata_read_sector()` (`kernel/ata.c`) hace un comando ATA completo (select+wait+DRQ-poll+256 lecturas de puerto de 16 bits+wait) por cada sector de 512 bytes, sin DMA ni comandos multi-sector (`READ MULTIPLE`). Cargar un modelo GGUF de decenas de MB implica cientos de miles de accesos a puertos de I/O. Bajo QEMU con `-accel tcg` cada `in`/`out` se emula en el mismo proceso (barato); bajo VirtualBox con virtualizacion de hardware real (VT-x) cada `in`/`out` es un VM-exit real hacia el hipervisor, ordenes de magnitud mas caro por acceso — de ahi que `loadmodel` tarde notablemente mas en VirtualBox que en QEMU para el mismo archivo. No es un bug de correctitud (la carga termina bien), pero es una mejora de rendimiento real y concreta para una etapa futura: agrupar lecturas en comandos `READ MULTIPLE` de N sectores en vez de 1 amortizaria el overhead de polling/comando por N.
+- [x] **Bug encontrado, sin resolver, mitigado por configuracion: RAM configurada en o cerca de exactamente 4096MB dispara corrupcion severa (pantalla llena de datos binarios del modelo interpretados como caracteres de video) al terminar de cargar un modelo** - Con Base Memory=4096MB, cargar `stories15M.gguf` terminaba con la pantalla completa de caracteres/colores aparentemente aleatorios (visualmente identico al hallazgo de boot-device-order de arriba, pero esta vez con el kernel corriendo — el shell seguia respondiendo antes de esto). Hipotesis de causa raiz, no confirmada: los chipsets de PC suelen reservar un hueco de MMIO por debajo de la linea de 4GB, remapeando una porcion de la RAM configurada por encima de 4GB — con esto, RAM≈4096MB puede ser la primera configuracion en toda la vida de este proyecto que efectivamente activa el camino de alta memoria/PAE (`kernel/highmem.c`, `kernel/vmm_pae.c`) fuera de los tests dedicados (`highmemtest`). Ese camino ya tiene un bug documentado y **sin causa raiz identificada** en la seccion "Roadmap de RAM Completa" mas arriba (migracion de tensores GGUF a memoria alta corrompiendo datos de forma rara y reproducible bajo QEMU) — es plausible que el mismo bug, bajo timing/layout de memoria distinto de VirtualBox, se manifieste de forma mucho mas severa. **Mitigacion verificada**: bajar Base Memory a 2048MB (todavia muy por encima de los 768MB que este modelo necesita segun el target `qemu-stories15`) elimina el problema por completo.
+- [x] **Verificado end-to-end en VirtualBox real** (`make iso` + disco IDE con `storage.vdi` conteniendo `stories15M.gguf`, Base Memory=2048MB, Graphics Controller=VBoxVGA, Boot Order solo Optica): boot completo hasta el shell interactivo en Ring 3, teclado PS/2 funcional sin repeats espurios, `ls`/`loadmodel`/`llm ask hello` encuentran y montan el FAT32 del disco IDE, y `llm ask hello` genera 32 tokens de texto real (mezcla de palabras reales y fragmentos, calidad comparable a la ya documentada en QEMU para este mismo modelo — sin evidencia de regresion). Primera vez que este proyecto corre fuera de QEMU.
+- [ ] Confirmar que el hardware objetivo (la PC real disponible para probar)
+  soporta boot BIOS/CSM heredado, o si es UEFI-only sin fallback — esto
+  decide si la Etapa 1 es alcanzable tal cual o si la Etapa 2 (UEFI) es
+  prerequisito, no una mejora posterior.
+- [ ] Confirmar controlador USB real disponible (`lspci`/Device Manager en el
+  hardware objetivo) para saber si vale la pena una Etapa 3 (xHCI) minima o
+  si conviene apuntar a otro objetivo.
+- [ ] Confirmar controlador de disco real disponible (AHCI es virtualmente
+  universal en PCs de la ultima decada, pero confirmar si hay modo IDE/legacy
+  disponible en BIOS como atajo antes de escribir un driver AHCI nuevo).
+- [ ] Confirmar chipset de red real disponible; si no es compatible, definir
+  si esta etapa se prueba sin red (aceptable, ya que shell/storage no
+  dependen de ella).
+- [ ] Decidir la superficie minima de "listo": ¿alcanza con boot + shell +
+  teclado, o hace falta storage/red reales para considerarlo un exito?
+
+#### Etapa 1: Pendrive booteable via BIOS/CSM, sin drivers nuevos (Pendiente)
+
+Probar el path mas barato primero: usar el boot BIOS/legacy que ya existe
+(README: "BIOS/GRUB/QEMU style boot flow") sin escribir ningun driver nuevo,
+para ver hasta donde llega el codigo actual en metal real.
+
+- [ ] Instalar GRUB2 en un pendrive USB con una entrada Multiboot v1 apuntando
+  a `build/kernel.bin`, replicando a mano lo que `make image-*` arma para las
+  imagenes de QEMU.
+- [ ] Arrancar la PC real con boot BIOS/CSM habilitado (no UEFI) desde ese
+  pendrive.
+- [ ] Documentar exactamente donde se detiene o que funciona: ¿GDT/IDT/PMM
+  arrancan? ¿VGA texto se ve? ¿PS/2 responde (si la PC tiene puerto PS/2
+  real, cada vez menos comun) o el teclado USB emulado por la BIOS como PS/2
+  ("USB Legacy Support") funciona con el driver PS/2 existente?
+- [ ] Si crashea, capturar el estado exacto (excepcion, registros) via el
+  panic handler existente (`kernel/idt.c`) en vez de adivinar — este proyecto
+  ya tiene precedente de bugs que solo aparecen fuera de QEMU (alineación de
+  stack/SSE, DMA/bus-mastering) y de diagnostico agregado especificamente
+  para encontrarlos.
+
+#### Etapa 2: Boot UEFI nativo (Pendiente)
+
+Solo necesaria si la Etapa 0/1 confirma que el hardware objetivo no tiene
+CSM/legacy boot disponible — cada vez mas comun en PCs nuevas.
+
+- [ ] Evaluar GRUB2 en modo UEFI cargando el kernel Multiboot v1 actual via
+  chainload (mas simple, sin tocar `kernel/boot.asm`) contra migrar a
+  Multiboot2 con entrada UEFI nativa (mas trabajo, menos dependencia de
+  GRUB).
+- [ ] Si hace falta Multiboot2: nuevo header de boot, y revisar que
+  `boot_modules.c`/`main.c` sigan recibiendo el mapa de memoria en un formato
+  que `pmm.c` entienda (Multiboot2 lo estructura distinto a Multiboot v1).
+- [ ] Verificar que el framebuffer entregado por UEFI GOP (en vez de VESA/VBE
+  BIOS) sea compatible con el codigo de framebuffer existente
+  (`kernel/video.c`) o necesite una ruta de deteccion separada.
+
+#### Etapa 3: Controlador USB moderno minimo (Pendiente)
+
+El driver UHCI actual (`kernel/uhci.c`) no sirve en hardware con solo
+xHCI/EHCI — casi todas las PCs de los ultimos 10-15 años. Adaptar el enfoque
+por etapas ya usado para UHCI (deteccion → bring-up → enumeracion → Bulk-Only
+Transport) en vez de intentar todo de una vez.
+
+- [ ] Elegir el objetivo minimo: xHCI (USB 3.x, el mas comun en hardware
+  reciente pero el protocolo mas complejo de los tres) vs EHCI (USB 2.0, mas
+  simple, y presente como "companion controller" en casi cualquier placa con
+  xHCI) — probablemente EHCI primero por ser mas chico, con xHCI como etapa
+  separada despues.
+- [ ] Deteccion via PCI (mismo patron que `uhci_find_controller`), pero con
+  BARs de tipo MMIO en vez de I/O ports puros — el kernel no tiene todavia
+  mapeo de BAR MMIO generico reusable fuera de casos puntuales (e1000, GPU),
+  revisar si conviene generalizarlo.
+- [ ] Bring-up minimo + deteccion de puertos, mismo criterio de verificacion
+  que UHCI Etapa 0+1 (log automático, sin crashear con o sin dispositivo).
+- [ ] Enumeracion + Bulk-Only Transport + block_device_t: reusar el diseño
+  ya probado de `kernel/uhci.c` (BOT/SCSI son identicos sobre cualquier host
+  controller; solo cambia la capa de transferencias de bajo nivel) en vez de
+  reescribirlo.
+
+#### Etapa 4: Storage AHCI minimo (Pendiente)
+
+`kernel/ata.c` (PIO puro) no existe en casi ningun disco real moderno
+configurado en modo AHCI (el default de fabrica en la enorme mayoria de PCs).
+
+- [ ] Confirmar si el BIOS objetivo ofrece modo IDE/legacy como atajo antes
+  de escribir un driver nuevo — si existe, esta etapa podria no ser
+  necesaria para una primera demo.
+- [ ] Si hace falta AHCI real: deteccion PCI, mapeo de BAR5 (ABAR) MMIO,
+  inicializacion de puertos, comandos FIS minimos para IDENTIFY/READ/WRITE —
+  comparable en alcance a la Etapa 0+1 de USB, mismo criterio incremental.
+- [ ] Envolver como `block_device_t` igual que `ata_primary_master()` y
+  `uhci_msd_primary()` — cero cambios en FAT32/ext2/VFS, mismo patron ya
+  probado dos veces.
+
+#### Etapa 5: NIC moderno o fallback (Pendiente)
+
+- [ ] Confirmar si el hardware objetivo trae un chipset de red compatible con
+  `e1000e`/`igb` (variantes mas nuevas de Intel, protocolo de registros
+  similar al e1000 actual) — si es asi, extender `kernel/net.c` podria ser
+  incremental en vez de un driver nuevo desde cero. Un chipset no-Intel
+  (Realtek, Broadcom, etc., lo mas comun en hardware de consumo) necesitaria
+  un driver enteramente distinto, fuera de alcance salvo que se decida
+  priorizarlo explicitamente.
+- [ ] Si no hay chipset compatible: aceptar que esta etapa queda sin
+  resolver para el hardware objetivo — storage/shell no dependen de red, asi
+  que no bloquea el resto del roadmap de hardware real.
+
+#### Criterio de listo
+
+- [ ] MicroK arranca en al menos una PC real (no VM) hasta el shell
+  interactivo, con teclado funcional.
+- [ ] El path de boot usado (BIOS/CSM o UEFI) queda documentado junto con el
+  hardware especifico probado (vendor/modelo, no solo "una PC").
+- [ ] Al menos un dispositivo de storage real (USB o interno) es accesible
+  como `block_device_t` y monta FAT32/ext2 de solo lectura.
+- [ ] Cualquier crash o bloqueo encontrado en hardware real queda
+  documentado con causa raiz identificada (no solo "no bootea"), siguiendo
+  el mismo estandar de las entradas de bug ya documentadas en este roadmap.
 
 ## Prioridad Actual
 

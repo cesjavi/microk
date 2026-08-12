@@ -3,11 +3,24 @@
 
 section .multiboot
 align 4
+; MICROK_NO_VIDEO_MODE (nasm -D flag): drop the GRAPHICS bit so the
+; bootloader never negotiates a VBE mode itself. Needed for GRUB on
+; VirtualBox/real BIOS, where GRUB's VBE mode-info parsing has a known bug
+; ("unsupported graphical mode type <garbage>") that aborts the multiboot
+; load entirely -- QEMU's own -kernel loader doesn't hit this, so the normal
+; build keeps requesting 800x600x32. Either way kernel/video.c already falls
+; back to VGA text mode when mbi->flags bit 11 (FRAMEBUFFER_INFO) is unset.
+%ifdef MICROK_NO_VIDEO_MODE
+%define MB_FLAGS 0x00000003
+%else
+%define MB_FLAGS 0x00000007
+%endif
     dd 0x1BADB002               ; Magic number
-    dd 0x00000007               ; Flags (ALIGNED + MEMINFO + GRAPHICS)
-    dd -(0x1BADB002 + 0x00000007) ; Checksum
-    
-    ; Graphics fields (mode_type, width, height, depth)
+    dd MB_FLAGS                 ; Flags (ALIGNED + MEMINFO [+ GRAPHICS])
+    dd -(0x1BADB002 + MB_FLAGS) ; Checksum
+
+    ; Graphics fields (mode_type, width, height, depth) - only consulted by
+    ; the bootloader when the GRAPHICS bit above is set.
     dd 0                        ; mode_type: 0 = linear graphics mode
     dd 800                      ; width
     dd 600                      ; height

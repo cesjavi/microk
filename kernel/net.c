@@ -128,6 +128,38 @@ typedef struct {
     uint16_t chksum;
 } __attribute__((packed)) udp_header_t;
 
+/* TCP: minimal header, no options (data_offset always 5, 20-byte header).
+ * Client-only, single connection at a time -- see the "TCP client" section
+ * below for the state machine this drives. */
+typedef struct {
+    uint16_t src_port;
+    uint16_t dest_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t  data_offset; /* high nibble = header length in 32-bit words */
+    uint8_t  flags;
+    uint16_t window;
+    uint16_t chksum;
+    uint16_t urgent;
+} __attribute__((packed)) tcp_header_t;
+
+#define TCP_FLAG_FIN 0x01
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_RST 0x04
+#define TCP_FLAG_PSH 0x08
+#define TCP_FLAG_ACK 0x10
+
+/* IPv4 pseudo-header, summed into the TCP checksum alongside the segment
+ * itself per RFC 793 -- unlike UDP's checksum (optional in IPv4, left as 0
+ * on TX by net_send_udp), TCP's is mandatory. */
+typedef struct {
+    uint8_t  src[4];
+    uint8_t  dest[4];
+    uint8_t  zero;
+    uint8_t  proto;
+    uint16_t tcp_len;
+} __attribute__((packed)) tcp_pseudo_header_t;
+
 typedef struct {
     uint8_t  type;
     uint8_t  code;
@@ -199,6 +231,11 @@ static inline uint32_t htonl(uint32_t h) {
            (((h >> 16) & 0xFF) << 8) | ((h >> 24) & 0xFF);
 }
 
+/* Byte-swap is its own inverse, same as ntohs/htons above. */
+static inline uint32_t ntohl(uint32_t n) {
+    return htonl(n);
+}
+
 static inline uint32_t e1000_read(uint32_t reg) {
     return *(volatile uint32_t *)(uintptr_t)(E1000_MMIO_VMEM + reg);
 }
@@ -245,6 +282,8 @@ static udp_binding_t udp_bindings[UDP_BINDINGS_MAX];
 static void append_str(char *out, uint32_t *pos, uint32_t max, const char *text);
 static void append_ip(char *out, uint32_t *pos, uint32_t max, const uint8_t ip[4]);
 static void append_mac(char *out, uint32_t *pos, uint32_t max, const uint8_t mac[6]);
+static void append_hex8(char *out, uint32_t *pos, uint32_t max, uint8_t value);
+static void append_hex32(char *out, uint32_t *pos, uint32_t max, uint32_t value);
 static int e1000_send_frame(const uint8_t *frame, uint16_t len);
 static void net_llm_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
                                  const uint8_t *payload, uint16_t len);
@@ -301,6 +340,31 @@ static uint16_t net_checksum16(const void *data, uint32_t len) {
     if (len) {
         sum += ((uint16_t)bytes[0] << 8);
     }
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
+/* Split form of net_checksum16 for TCP, whose checksum covers two
+ * non-contiguous regions (the IPv4 pseudo-header, then the TCP segment) --
+ * accumulate over each with net_checksum16_partial, then fold/complement
+ * once at the end with net_checksum16_finish. net_checksum16 itself is left
+ * untouched since ICMP/IP callers only ever sum one contiguous buffer. */
+static uint32_t net_checksum16_partial(const void *data, uint32_t len, uint32_t sum) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    while (len > 1) {
+        sum += ((uint16_t)bytes[0] << 8) | bytes[1];
+        bytes += 2;
+        len -= 2;
+    }
+    if (len) {
+        sum += ((uint16_t)bytes[0] << 8);
+    }
+    return sum;
+}
+
+static uint16_t net_checksum16_finish(uint32_t sum) {
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -492,44 +556,52 @@ static int e1000_send_frame(const uint8_t *frame, uint16_t len) {
 /* Forward declaration — defined below the ARP section */
 static int net_send_arp_request(const uint8_t target_ip[4]);
 
+/* Resolves dest_ip to a MAC address: broadcast shortcut, then ARP cache,
+ * then an ARP request polled for up to 1s. Shared by net_send_udp and the
+ * TCP sender below -- extracted rather than duplicated since both need the
+ * exact same cache-then-request-then-poll sequence. Returns 1 and fills
+ * out_mac on success, 0 on failure (e.g. ARP timeout). */
+static int net_resolve_mac(const uint8_t dest_ip[4], uint8_t out_mac[6]) {
+    static const uint8_t broadcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    static const uint8_t broadcast_ip[4]  = {0xFF,0xFF,0xFF,0xFF};
+
+    if (memcmp(dest_ip, broadcast_ip, 4) == 0) {
+        memcpy(out_mac, broadcast_mac, 6);
+        return 1;
+    }
+
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (arp_cache[i].valid && memcmp(arp_cache[i].ip, dest_ip, 4) == 0) {
+            memcpy(out_mac, arp_cache[i].mac, 6);
+            return 1;
+        }
+    }
+
+    extern uint32_t timer_get_ticks(void);
+    net_send_arp_request(dest_ip);
+    uint32_t deadline = timer_get_ticks() + 100;
+    while (timer_get_ticks() < deadline) {
+        net_poll();
+        for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+            if (arp_cache[i].valid && memcmp(arp_cache[i].ip, dest_ip, 4) == 0) {
+                memcpy(out_mac, arp_cache[i].mac, 6);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* net_send_udp: send a UDP datagram to dest_ip:dest_port from src_port.
  * Handles ARP resolution automatically; dest_ip=255.255.255.255 uses broadcast MAC. */
 int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port,
                  const uint8_t *payload, uint16_t payload_len) {
-    static const uint8_t broadcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    static const uint8_t broadcast_ip[4]  = {0xFF,0xFF,0xFF,0xFF};
     uint8_t dest_mac[6];
 
     if (!e1000_rings_ready || !net_config.nic_present || !dest_ip) return 0;
 
-    if (memcmp(dest_ip, broadcast_ip, 4) == 0) {
-        memcpy(dest_mac, broadcast_mac, 6);
-    } else {
-        int found = 0;
-        for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-            if (arp_cache[i].valid && memcmp(arp_cache[i].ip, dest_ip, 4) == 0) {
-                memcpy(dest_mac, arp_cache[i].mac, 6);
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            extern uint32_t timer_get_ticks(void);
-            net_send_arp_request(dest_ip);
-            uint32_t deadline = timer_get_ticks() + 100;
-            while (timer_get_ticks() < deadline) {
-                net_poll();
-                for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-                    if (arp_cache[i].valid && memcmp(arp_cache[i].ip, dest_ip, 4) == 0) {
-                        memcpy(dest_mac, arp_cache[i].mac, 6);
-                        found = 1;
-                        break;
-                    }
-                }
-                if (found) break;
-            }
-            if (!found) return 0;
-        }
+    if (!net_resolve_mac(dest_ip, dest_mac)) {
+        return 0;
     }
 
     uint16_t udp_data_len = payload_len;
@@ -575,6 +647,120 @@ int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port
     udp->chksum    = 0; // optional for IPv4
 
     if (payload && udp_data_len) memcpy(data, payload, udp_data_len);
+
+    if (frame_len < 60) { memset(frame + frame_len, 0, 60 - frame_len); frame_len = 60; }
+    return e1000_send_frame(frame, (uint16_t)frame_len);
+}
+
+/* ---- TCP client (single connection, synchronous/polled) ----
+ *
+ * Enough TCP to drive one blocking request/response exchange (net_http_get,
+ * below) -- not a general sockets API. One connection at a time, no
+ * retransmission queue: outbound segments (SYN, request data, FIN) are sent
+ * once and rely on the caller's own poll-with-deadline loop timing out if
+ * they're lost, the same way net_ping/net_dns_resolve already handle ARP/DNS
+ * timeouts. Inbound reliability is the remote peer's problem, as with any
+ * TCP receiver -- we just need to ACK promptly, which we do.
+ *
+ * TCP_WINDOW is a fixed advertised window rather than one derived from
+ * actual buffer headroom -- simpler, and fine for the small, short-lived
+ * transfers this is built for; data arriving past the caller's receive
+ * buffer is simply not copied (but still ACKed, so the connection doesn't
+ * stall waiting for us). */
+#define TCP_WINDOW 8192
+
+typedef enum {
+    TCP_CLOSED = 0,
+    TCP_SYN_SENT,
+    TCP_ESTABLISHED,
+    TCP_DONE /* FIN or RST seen; net_http_get is finished with this connection */
+} tcp_conn_state_t;
+
+typedef struct {
+    tcp_conn_state_t state;
+    uint8_t  remote_ip[4];
+    uint16_t remote_port;
+    uint16_t local_port;
+    uint32_t local_seq;  /* next sequence number *we* will send */
+    uint32_t remote_seq; /* next sequence number expected from remote == our ack field */
+    int      rst_received;
+    int      fin_received;
+} tcp_conn_t;
+
+static tcp_conn_t tcp_conn;
+static uint16_t   tcp_next_local_port = 49152; /* ephemeral range, RFC 6335 */
+
+/* Receive buffer for the connection currently in ESTABLISHED state -- set
+ * by net_http_get before it starts polling, written to by net_handle_tcp as
+ * segments arrive. */
+static uint8_t  *tcp_recv_buf      = 0;
+static uint32_t  tcp_recv_buf_size = 0;
+static uint32_t  tcp_recv_len      = 0;
+
+/* Builds and sends one TCP segment for the current tcp_conn: Ethernet + IP +
+ * TCP header (no options) + optional payload, checksummed per RFC 793
+ * (pseudo-header + segment). Does not touch tcp_conn.local_seq -- callers
+ * advance it themselves by exactly what SYN/FIN/data each consume, since
+ * this function may be called to retransmit the *same* sequence number
+ * (e.g. re-ACKing) as well as to advance it. */
+static int net_send_tcp_segment(uint8_t flags, const uint8_t *payload, uint16_t payload_len) {
+    uint8_t dest_mac[6];
+    if (!e1000_rings_ready || !net_config.nic_present) return 0;
+    if (!net_resolve_mac(tcp_conn.remote_ip, dest_mac)) return 0;
+
+    uint32_t ip_len32 = (uint32_t)sizeof(ip_header_t) + sizeof(tcp_header_t) + payload_len;
+    uint32_t frame_len = sizeof(eth_header_t) + ip_len32;
+    if (frame_len > E1000_TX_BUF_SIZE) return 0;
+    uint16_t ip_len = (uint16_t)ip_len32;
+
+    uint8_t frame[E1000_TX_BUF_SIZE];
+    memset(frame, 0, frame_len);
+
+    eth_header_t *eth = (eth_header_t *)frame;
+    ip_header_t  *ip  = (ip_header_t *)(frame + sizeof(eth_header_t));
+    tcp_header_t *tcp = (tcp_header_t *)(frame + sizeof(eth_header_t) + sizeof(ip_header_t));
+    uint8_t      *data = frame + sizeof(eth_header_t) + sizeof(ip_header_t) + sizeof(tcp_header_t);
+
+    memcpy(eth->dest, dest_mac, 6);
+    memcpy(eth->src, net_config.mac, 6);
+    eth->type = htons(0x0800);
+
+    ip->version_ihl  = 0x45;
+    ip->tos          = 0;
+    ip->len          = htons(ip_len);
+    ip->id           = htons(0x4D4C); /* 'ML' -- distinct from UDP's 'MK' id */
+    ip->flags_offset = 0;
+    ip->ttl          = 64;
+    ip->proto        = 6; /* TCP */
+    ip->chksum       = 0;
+    memcpy(ip->src,  net_config.ip,        4);
+    memcpy(ip->dest, tcp_conn.remote_ip,   4);
+    ip->chksum = htons(net_checksum16(ip, sizeof(ip_header_t)));
+
+    tcp->src_port    = htons(tcp_conn.local_port);
+    tcp->dest_port   = htons(tcp_conn.remote_port);
+    tcp->seq         = htonl(tcp_conn.local_seq);
+    tcp->ack         = htonl((flags & TCP_FLAG_ACK) ? tcp_conn.remote_seq : 0);
+    tcp->data_offset = (uint8_t)((sizeof(tcp_header_t) / 4) << 4);
+    tcp->flags       = flags;
+    tcp->window      = htons(TCP_WINDOW);
+    tcp->chksum      = 0;
+    tcp->urgent      = 0;
+
+    if (payload && payload_len) {
+        memcpy(data, payload, payload_len);
+    }
+
+    tcp_pseudo_header_t pseudo;
+    memcpy(pseudo.src,  net_config.ip,      4);
+    memcpy(pseudo.dest, tcp_conn.remote_ip, 4);
+    pseudo.zero    = 0;
+    pseudo.proto   = 6;
+    pseudo.tcp_len = htons((uint16_t)(sizeof(tcp_header_t) + payload_len));
+
+    uint32_t sum = net_checksum16_partial(&pseudo, sizeof(pseudo), 0);
+    sum = net_checksum16_partial(tcp, sizeof(tcp_header_t) + payload_len, sum);
+    tcp->chksum = htons(net_checksum16_finish(sum));
 
     if (frame_len < 60) { memset(frame + frame_len, 0, 60 - frame_len); frame_len = 60; }
     return e1000_send_frame(frame, (uint16_t)frame_len);
@@ -790,6 +976,71 @@ static void net_handle_icmp(const eth_header_t *eth, const ip_header_t *ip,
     }
 }
 
+/* Handles one TCP segment against the single active tcp_conn -- everything
+ * else (other ports, other remote hosts, a second connection) is silently
+ * ignored, since this client only ever has one connection open. No
+ * reordering/reassembly: a segment whose sequence number doesn't match
+ * exactly what we expect is dropped (the sender's own TCP retransmit timer
+ * will resend it -- that's how TCP receivers are supposed to behave, not a
+ * shortcut specific to this implementation). */
+static void net_handle_tcp(const ip_header_t *ip, const uint8_t *tcp_start, uint32_t tcp_seg_len) {
+    if (tcp_seg_len < sizeof(tcp_header_t)) return;
+    if (tcp_conn.state == TCP_CLOSED || tcp_conn.state == TCP_DONE) return;
+
+    const tcp_header_t *tcp = (const tcp_header_t *)tcp_start;
+    if (ntohs(tcp->dest_port) != tcp_conn.local_port) return;
+    if (ntohs(tcp->src_port) != tcp_conn.remote_port) return;
+    if (memcmp(ip->src, tcp_conn.remote_ip, 4) != 0) return;
+
+    uint32_t data_offset_bytes = (uint32_t)((tcp->data_offset >> 4) & 0x0F) * 4;
+    if (data_offset_bytes < sizeof(tcp_header_t) || data_offset_bytes > tcp_seg_len) return;
+    const uint8_t *payload = tcp_start + data_offset_bytes;
+    uint32_t payload_len = tcp_seg_len - data_offset_bytes;
+
+    if (tcp->flags & TCP_FLAG_RST) {
+        tcp_conn.rst_received = 1;
+        tcp_conn.state = TCP_DONE;
+        return;
+    }
+
+    if (tcp_conn.state == TCP_SYN_SENT) {
+        if ((tcp->flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)
+            && ntohl(tcp->ack) == tcp_conn.local_seq + 1) {
+            tcp_conn.local_seq += 1;
+            tcp_conn.remote_seq = ntohl(tcp->seq) + 1;
+            tcp_conn.state = TCP_ESTABLISHED;
+            net_send_tcp_segment(TCP_FLAG_ACK, 0, 0);
+        }
+        return;
+    }
+
+    if (tcp_conn.state != TCP_ESTABLISHED) return;
+    if (ntohl(tcp->seq) != tcp_conn.remote_seq) return; /* out of order / retransmit we already have -- drop */
+
+    int has_fin = (tcp->flags & TCP_FLAG_FIN) != 0;
+    if (payload_len == 0 && !has_fin) return; /* pure ACK: nothing new to acknowledge, don't ACK an ACK */
+
+    if (payload_len > 0 && tcp_recv_buf && tcp_recv_len < tcp_recv_buf_size) {
+        uint32_t space = tcp_recv_buf_size - tcp_recv_len;
+        uint32_t copy_len = payload_len < space ? payload_len : space;
+        memcpy(tcp_recv_buf + tcp_recv_len, payload, copy_len);
+        tcp_recv_len += copy_len;
+    }
+    tcp_conn.remote_seq += payload_len;
+
+    if (has_fin) {
+        tcp_conn.remote_seq += 1;
+        tcp_conn.fin_received = 1;
+        /* Active close: FIN+ACK back, no TIME_WAIT -- acceptable for a
+         * one-shot client that picks a fresh ephemeral port next time. */
+        net_send_tcp_segment((uint8_t)(TCP_FLAG_FIN | TCP_FLAG_ACK), 0, 0);
+        tcp_conn.local_seq += 1;
+        tcp_conn.state = TCP_DONE;
+    } else {
+        net_send_tcp_segment(TCP_FLAG_ACK, 0, 0);
+    }
+}
+
 static int net_send_arp_reply(const arp_packet_t *request) {
     uint8_t frame[sizeof(eth_header_t) + sizeof(arp_packet_t)];
     eth_header_t *eth = (eth_header_t *)frame;
@@ -842,7 +1093,7 @@ static void net_handle_arp(arp_packet_t *arp) {
 void net_handle_packet(uint8_t *data, uint32_t len) {
     if (len < sizeof(eth_header_t)) return;
     eth_header_t *eth = (eth_header_t *)data;
-    
+
     // Check for ARP (0x0806 swapped is 0x0608)
     if (eth->type == 0x0608) {
         if (len < sizeof(eth_header_t) + sizeof(arp_packet_t)) return;
@@ -868,8 +1119,30 @@ void net_handle_packet(uint8_t *data, uint32_t len) {
 
     uint32_t ip_payload_len = len - sizeof(eth_header_t) - ip_header_len;
 
+    /* Ethernet enforces a 60-byte minimum frame size, so any real payload
+     * shorter than that arrives zero-padded -- ip_payload_len above (raw
+     * bytes remaining in the frame) includes that padding. UDP already
+     * guards against this by trusting its own self-describing udp->len
+     * field instead of the raw remaining count (see below); ICMP and TCP
+     * have no such field of their own and rely entirely on the IP header's
+     * declared total length, so clamp to that here. Without this, e.g. a
+     * TCP ACK-only segment (0 real payload bytes) padded up to the 60-byte
+     * minimum was being treated as if it carried a handful of trailing
+     * zero bytes as real data -- silently corrupting the start of a TCP
+     * stream and desyncing sequence-number tracking for the rest of the
+     * connection. */
+    uint16_t ip_total_len = ntohs(ip->len);
+    if (ip_total_len >= ip_header_len && (uint32_t)(ip_total_len - ip_header_len) < ip_payload_len) {
+        ip_payload_len = ip_total_len - ip_header_len;
+    }
+
     if (ip->proto == 1) { // ICMP
         net_handle_icmp(eth, ip, data + sizeof(eth_header_t) + ip_header_len, ip_payload_len);
+        return;
+    }
+
+    if (ip->proto == 6) { // TCP
+        net_handle_tcp(ip, data + sizeof(eth_header_t) + ip_header_len, ip_payload_len);
         return;
     }
 
@@ -1270,15 +1543,26 @@ void net_poll(void) {
         desc->status = 0;
         desc->errors = 0;
         desc->length = 0;
-        e1000_rx_cur = (e1000_rx_cur + 1) % E1000_RX_DESC_COUNT;
-        // RDT must be the new head of the software-owned free region, i.e.
-        // the post-increment index -- not the descriptor we just freed.
-        // The e1000 treats the ring as non-empty exactly while RDH != RDT,
-        // so writing the just-freed index here leaves that one descriptor
-        // excluded from hardware's available set until the next packet
-        // rotates it back in, permanently capping the ring at N-1 usable
-        // descriptors instead of returning each one immediately.
+        // RDT must be the index of the descriptor we just freed (the
+        // pre-increment cursor), not the post-increment one. QEMU's e1000
+        // model (hw/net/e1000.c, e1000_has_rxbufs) treats the ring as
+        // non-empty exactly while RDH != RDT for a short packet -- and
+        // hardware's own RDH advances to match wherever it just finished
+        // writing, i.e. to the *post-increment* index, the instant it
+        // delivers a packet. Writing that same post-increment value here
+        // makes RDH == RDT the moment hardware catches up, which QEMU reads
+        // as "zero descriptors available" and silently drops every
+        // following packet (confirmed via `-trace e1000_receiver_overrun`:
+        // "RDH=1, RDT=1" right after the first packet was drained) -- a
+        // permanent stall, not just a capped ring, since nothing ever moves
+        // RDT again once stuck. Writing the freed (pre-increment) index
+        // instead keeps RDT one step behind RDH, which is exactly the
+        // invariant the initial RDT = E1000_RX_DESC_COUNT - 1 (with
+        // RDH = 0) already established at ring init -- this preserves it
+        // on every subsequent packet instead of collapsing it after the
+        // first.
         e1000_write(E1000_REG_RDT, e1000_rx_cur);
+        e1000_rx_cur = (e1000_rx_cur + 1) % E1000_RX_DESC_COUNT;
     }
 
     net_poll_active = 0;
@@ -1682,6 +1966,130 @@ int net_config_dns(const char *dns) {
     memcpy(net_config.dns, parsed_dns, sizeof(net_config.dns));
     net_config.has_config = 1;
     return 1;
+}
+
+/* ---- TCP connect/close + minimal HTTP client ---- */
+
+/* Opens the single TCP connection: sends SYN, waits ~1s for SYN-ACK,
+ * retrying the SYN (same ISN) up to 2 more times on timeout -- connection
+ * setup is the one step worth retrying here, since net_http_get's request
+ * and close aren't retried at all (see the "TCP client" section above for
+ * why). Returns 0 on success, -1 if the NIC/link isn't up, -2 on handshake
+ * timeout or an RST from the remote. */
+static int net_tcp_connect(const uint8_t dest_ip[4], uint16_t dest_port) {
+    extern uint32_t timer_get_ticks(void);
+    if (!e1000_rings_ready || !net_config.nic_present) return -1;
+
+    memset(&tcp_conn, 0, sizeof(tcp_conn));
+    memcpy(tcp_conn.remote_ip, dest_ip, 4);
+    tcp_conn.remote_port = dest_port;
+    tcp_conn.local_port  = tcp_next_local_port++;
+    if (tcp_next_local_port == 0) {
+        tcp_next_local_port = 49152; /* wrapped past 65535 */
+    }
+
+    /* ISN doesn't need to be cryptographically random for a lab kernel --
+     * just distinct enough per connection that a stray segment from an
+     * earlier connection on the same local port doesn't look current. */
+    tcp_conn.local_seq = timer_get_ticks() ^ ((uint32_t)tcp_conn.local_port << 16);
+    tcp_conn.state = TCP_SYN_SENT;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        net_send_tcp_segment(TCP_FLAG_SYN, 0, 0);
+
+        uint32_t deadline = timer_get_ticks() + 100; /* 1s per attempt */
+        while (timer_get_ticks() < deadline && tcp_conn.state == TCP_SYN_SENT) {
+            net_poll();
+        }
+        if (tcp_conn.state == TCP_ESTABLISHED) {
+            return 0;
+        }
+        if (tcp_conn.state == TCP_DONE) {
+            return -2; /* RST */
+        }
+    }
+    tcp_conn.state = TCP_CLOSED;
+    return -2;
+}
+
+/* Best-effort abandon for a connection net_http_get is giving up on before
+ * it reached TCP_DONE via a normal FIN exchange (timeout, full receive
+ * buffer). Sends one RST and stops -- not a graceful close, but this
+ * connection's ephemeral port won't be reused for a long time regardless. */
+static void net_tcp_abort(void) {
+    if (tcp_conn.state == TCP_ESTABLISHED || tcp_conn.state == TCP_SYN_SENT) {
+        net_send_tcp_segment((uint8_t)(TCP_FLAG_RST | TCP_FLAG_ACK), 0, 0);
+    }
+    tcp_conn.state = TCP_CLOSED;
+}
+
+/* Blocking HTTP/1.0 GET: resolves host (net_dns_resolve, so dotted-quad IPs
+ * work directly too, no DNS needed), opens a TCP connection, sends the
+ * request, and copies whatever response bytes arrive (headers + body,
+ * verbatim -- no parsing) into out[] until the connection closes or out
+ * fills up. This is deliberately just "enough TCP to fetch something",
+ * matching the roadmap's "preparar base para HTTP simple" -- no chunked
+ * transfer-encoding, no redirects, no keep-alive.
+ * Returns the number of bytes written to out on success (>=0, 0 is a valid
+ * empty response), or a negative error: -1 bad arguments or DNS failure,
+ * -2 TCP connect failed, -3 could not send the request, -4 no response
+ * bytes ever arrived before giving up. */
+int net_http_get(const char *host, uint16_t port, const char *path, char *out, uint32_t out_size) {
+    extern uint32_t timer_get_ticks(void);
+    if (!host || !path || !out || out_size == 0) {
+        return -1;
+    }
+
+    uint8_t dest_ip[4];
+    if (!net_dns_resolve(host, dest_ip)) {
+        return -1;
+    }
+
+    if (net_tcp_connect(dest_ip, port) != 0) {
+        return -2;
+    }
+
+    char request[256];
+    uint32_t pos = 0;
+    append_str(request, &pos, sizeof(request), "GET ");
+    append_str(request, &pos, sizeof(request), path);
+    append_str(request, &pos, sizeof(request), " HTTP/1.0\r\nHost: ");
+    append_str(request, &pos, sizeof(request), host);
+    append_str(request, &pos, sizeof(request), "\r\nConnection: close\r\n\r\n");
+
+    uint16_t req_len = (uint16_t)pos;
+    if (!net_send_tcp_segment((uint8_t)(TCP_FLAG_PSH | TCP_FLAG_ACK), (const uint8_t *)request, req_len)) {
+        net_tcp_abort();
+        return -3;
+    }
+    tcp_conn.local_seq += req_len;
+
+    tcp_recv_buf      = (uint8_t *)out;
+    tcp_recv_buf_size = out_size;
+    tcp_recv_len      = 0;
+
+    uint32_t deadline = timer_get_ticks() + 500; /* 5s to receive the whole response */
+    while (timer_get_ticks() < deadline && tcp_conn.state == TCP_ESTABLISHED) {
+        net_poll();
+        if (tcp_recv_len >= tcp_recv_buf_size) {
+            break;
+        }
+    }
+
+    int had_data       = (tcp_recv_len > 0);
+    int closed_cleanly = (tcp_conn.state == TCP_DONE && tcp_conn.fin_received);
+
+    tcp_recv_buf      = 0;
+    tcp_recv_buf_size = 0;
+
+    if (tcp_conn.state != TCP_DONE) {
+        net_tcp_abort(); /* timed out or buffer filled mid-stream */
+    }
+
+    if (!had_data && !closed_cleanly) {
+        return -4;
+    }
+    return (int)tcp_recv_len;
 }
 
 /* ---- Remote shell (RSH) UDP service ---- */

@@ -65,6 +65,11 @@ void net_udp_unbind(uint16_t port);
  * Also accepts dotted-quad strings directly (no query needed). */
 int net_dns_resolve(const char *hostname, uint8_t out_ip[4]);
 
+/* Blocking HTTP/1.0 GET, single connection at a time (see kernel/net.c for
+ * the TCP client this is built on). Returns bytes written to out (>=0) on
+ * success, negative on failure. */
+int net_http_get(const char *host, uint16_t port, const char *path, char *out, uint32_t out_size);
+
 /* LLM service token: empty string or "off" disables auth */
 int net_llm_service_set_token(const char *token);
 

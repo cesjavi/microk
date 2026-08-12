@@ -61,8 +61,19 @@ enum {
     SYS_IPC_SHM_SELFTEST = 58,
     SYS_LLM_DUMP_LOGITS = 59,
     SYS_HBUF_SELFTEST = 60,
-    SYS_USB_STATUS_STR = 61
+    SYS_USB_STATUS_STR = 61,
+    SYS_USB_MSD_TEST_STR = 62,
+    SYS_HTTP_GET = 63
 };
+
+/* Mirrors the identically-named struct in kernel/syscall.c -- fixed-size
+ * embedded strings (not pointers) so the syscall only needs to validate one
+ * contiguous user region, not chase pointers-within-a-struct. */
+typedef struct {
+    char host[64];
+    char path[128];
+    uint16_t port;
+} net_http_get_req_t;
 
 static inline void syscall_print(const char *msg) {
     asm volatile ("int $0x80" : : "a"(SYS_PRINT), "c"(msg) : "memory");
@@ -262,6 +273,22 @@ static inline void syscall_gpu_status_str(char *buf) {
 
 static inline void syscall_usb_status_str(char *buf) {
     asm volatile ("int $0x80" : : "a"(SYS_USB_STATUS_STR), "c"(buf) : "memory");
+}
+
+static inline void syscall_usb_msd_test_str(char *buf, int with_write_test) {
+    asm volatile ("int $0x80" : : "a"(SYS_USB_MSD_TEST_STR), "c"(buf), "d"(with_write_test) : "memory");
+}
+
+static inline int syscall_http_get(const char *host, uint16_t port, const char *path, char *out, uint32_t out_size) {
+    net_http_get_req_t req;
+    memset(&req, 0, sizeof(req));
+    strncpy(req.host, host, sizeof(req.host) - 1);
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    req.port = port;
+
+    int result = 0;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_HTTP_GET), "c"(&req), "d"(out), "b"(out_size) : "memory");
+    return result;
 }
 
 static inline void syscall_arp_status_str(char *buf) {
@@ -620,8 +647,14 @@ static void shell_gpu_info(void) {
 }
 
 static void shell_usb_info(void) {
-    char buf[256];
+    char buf[512];
     syscall_usb_status_str(buf);
+    syscall_print(buf);
+}
+
+static void shell_usb_msd_test(int with_write_test) {
+    char buf[512];
+    syscall_usb_msd_test_str(buf, with_write_test);
     syscall_print(buf);
 }
 
@@ -836,7 +869,7 @@ static void shell_autocomplete(char *line, int *idx) {
     if (plen == 0 && !is_command) return;
 
     if (is_command) {
-        const char *cmds[] = {"help", "clear", "status", "mem", "mem test", "highmemtest", "highmemtest buf", "ls", "cat", "cd", "loadmodel", "llm", "usb", 0};
+        const char *cmds[] = {"help", "clear", "status", "mem", "mem test", "highmemtest", "highmemtest buf", "ls", "cat", "cd", "loadmodel", "llm", "usb", "usb msdtest", "usb msdwritetest", "http get", 0};
         for (int i = 0; cmds[i]; i++) {
             if (shell_strncasecmp(cmds[i], prefix, plen) == 0) {
                 strncpy(line, cmds[i], 63);
@@ -880,12 +913,42 @@ static void shell_net_config_static(char *args) {
     }
 }
 
+static void shell_http_get(char *args) {
+    char *cursor = args;
+    char *host = next_token(&cursor);
+    char *path = next_token(&cursor);
+
+    if (!host) {
+        syscall_print("Usage: http get <host> <path>\n");
+        return;
+    }
+    if (!path) {
+        path = "/";
+    }
+
+    char buf[512];
+    int rc = syscall_http_get(host, 80, path, buf, sizeof(buf));
+    if (rc < 0) {
+        char tmp[8];
+        syscall_print("http get: failed (rc=");
+        itoa(-rc, tmp, 10);
+        syscall_print(tmp);
+        syscall_print(")\n");
+        return;
+    }
+
+    uint32_t shown = (uint32_t)rc < sizeof(buf) ? (uint32_t)rc : sizeof(buf) - 1;
+    buf[shown] = '\0';
+    syscall_print(buf);
+    syscall_print("\n");
+}
+
 static void shell_handle_command(char *line) {
     if (line[0] == '!') {
         syscall_put_char('\n');
         shell_run_llm_query(line + 1);
     } else if (strcmp(line, "help") == 0) {
-        syscall_print("Commands: help, clear, status, mem, mem map, mem test, highmemtest, highmemtest buf, heaptest, ls [dir], cat <file>, cd <dir>, loadmodel <file>, extls, extcat <file>, fs, gpu, gpu info, net status, net config dhcp, net config static <ip> <mask> <gw>, net config save, ipc shmtest, dhcp renew, arp, ping <ip>, nslookup <host>, rsh on|off|status|port <p>|token <t|off>, llm status, llm info, llm selftest, llm selftest gguf, llm trace on|off|status, llm net on|off|status|port <p>|token <t|off>, llm ask <p>, llm logits <p>, llm chat <p>, usb, !<p>\n");
+        syscall_print("Commands: help, clear, status, mem, mem map, mem test, highmemtest, highmemtest buf, heaptest, ls [dir], cat <file>, cd <dir>, loadmodel <file>, extls, extcat <file>, fs, gpu, gpu info, net status, net config dhcp, net config static <ip> <mask> <gw>, net config save, ipc shmtest, dhcp renew, arp, ping <ip>, nslookup <host>, rsh on|off|status|port <p>|token <t|off>, llm status, llm info, llm selftest, llm selftest gguf, llm trace on|off|status, llm net on|off|status|port <p>|token <t|off>, llm ask <p>, llm logits <p>, llm chat <p>, usb, usb msdtest, usb msdwritetest, http get <host> <path>, !<p>\n");
     } else if (strcmp(line, "ls") == 0) {
         syscall_fat_ls(shell_cwd[0] ? shell_cwd : 0);
     } else if (strstr(line, "ls ") == line) {
@@ -925,6 +988,12 @@ static void shell_handle_command(char *line) {
         shell_gpu_info();
     } else if (strcmp(line, "usb") == 0) {
         shell_usb_info();
+    } else if (strcmp(line, "usb msdtest") == 0) {
+        shell_usb_msd_test(0);
+    } else if (strcmp(line, "usb msdwritetest") == 0) {
+        shell_usb_msd_test(1);
+    } else if (strstr(line, "http get ") == line) {
+        shell_http_get(line + 9);
     } else if (strcmp(line, "net status") == 0) {
         char buf[256];
         syscall_net_status_str(buf);

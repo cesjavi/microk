@@ -61,7 +61,8 @@ available for that model.
 - Basic `int 0x80` syscalls.
 - VFS and experimental storage stack.
 - ATA PIO, MBR/GPT, FAT32/ext/NTFS probes.
-- Network configuration scaffold with DHCP/static modes, e1000 PCI detection, experimental polling RX/TX rings, `net status`, and a UDP LLM service path.
+- Network configuration scaffold with DHCP/static modes, e1000 PCI detection, experimental polling RX/TX rings, `net status`, a UDP LLM service path, and a minimal single-connection TCP client with a blocking HTTP/1.0 GET (`http get <host> <path>`).
+- USB Mass Storage over UHCI: controller bring-up, device enumeration, Bulk-Only Transport + minimal SCSI, and `block_device_t`/VFS integration (mounts read-only as FAT32 alongside the ATA disk).
 - FAT32 read-only supports 8.3 names, basic ASCII VFAT long names, and subdirectories.
 - `loadmodel` is handled in kernel space and reads FAT32 models into PMM-allocated contiguous memory instead of a fixed shell-adjacent address.
 - `loadmodel` reports required KiB, total free low memory, largest contiguous low-memory block, and high-memory pool status before allocating a model buffer.
@@ -95,6 +96,16 @@ roadmap.
 - `FAT32` read-oriented access with subdirectories and ASCII VFAT long names
 - Initial `ext2` read-only path
 - `PCI` bus scan and device enumeration
+- `UHCI` (USB 1.1) controller bring-up, device enumeration, Bulk-Only
+  Transport + minimal SCSI (`INQUIRY`/`TEST UNIT READY`/`READ CAPACITY(10)`/
+  `READ(10)`/`WRITE(10)`), and `block_device_t`/VFS integration -- an
+  attached USB mass-storage device mounts read-only as FAT32 alongside the
+  ATA disk with zero filesystem-layer changes. Exercised via the
+  `usb`/`usb msdtest`/`usb msdwritetest` shell commands and logged
+  automatically at boot (see `ROADMAP.md`, USB Mass Storage Etapa 0-4)
+- Minimal single-connection TCP client (3-way handshake, data, active close)
+  and a blocking HTTP/1.0 GET (`net_http_get`, shell command `http get <host>
+  <path>`) -- enough to fetch something, not a general sockets API
 
 ### Detected / diagnostics only
 
@@ -111,9 +122,11 @@ roadmap.
 - Native `AMD` acceleration/compute path
 - `AHCI`
 - `NVMe`
-- `USB` input/storage/network
+- USB input devices (keyboard/mouse); OHCI/EHCI/xHCI controllers (UHCI only)
 - Full `UEFI-first` boot path
-- Full network stack (`DHCP` client, robust `IPv4`, `UDP/TCP`, `SSH`)
+- Full network stack: TCP is a minimal single-connection client only (enough
+  for one blocking HTTP/1.0 GET, see `net_http_get`), no server sockets, no
+  `SSH`
 - General-purpose use of RAM above `4 GB`
 - Full GGUF inference runtime comparable to a userspace LLM engine
 
@@ -328,10 +341,11 @@ bash scripts/qemu_udp_smoke.sh
 ```
 
 Current known state: `make qemu-net` enables the LLM UDP service from
-`/microk/net.cfg`, ARP request/reply works in QEMU, and QEMU emits the UDP frame
-after ARP resolution. The remaining bug is in consuming that follow-up UDP frame
-from the e1000 RX ring, so `qemu_udp_smoke.sh` may still time out until RX
-recycling is hardened.
+`/microk/net.cfg`, ARP resolves, and the full PING/PONG round trip works —
+`qemu_udp_smoke.sh` passes end-to-end. This was previously flaky because of an
+e1000 RX ring bug (the driver could permanently stop accepting packets after
+the very first non-ARP frame); see `ROADMAP.md`'s "TCP client" section under
+the Network roadmap for the fix and how it was found.
 
 ## Limitations
 
@@ -341,7 +355,7 @@ recycling is hardened.
 - FAT32/ext/NTFS support is experimental/read-only/probe-level.
 - FAT32 shell navigation supports relative paths, `.` and `..`, and displays
   ASCII VFAT long names when present.
-- Network configuration, e1000 PCI detection, MAC readout, experimental RX/TX rings, and a UDP LLM protocol path exist. NIC interrupts, ICMP, TCP, DHCP, and robust IPv4 routing are not implemented yet.
+- Network configuration, e1000 PCI detection, MAC readout, experimental RX/TX rings, ARP, ICMP echo, DHCP, DNS, and a UDP LLM protocol path exist. TCP is a minimal single-connection client only (one blocking HTTP/1.0 GET at a time, no server sockets). NIC interrupts and robust IPv4 routing are not implemented yet.
 - Disk-loaded models still require one contiguous low-memory buffer; RAM above 4GB is diagnostic/experimental and is not used for model buffers yet.
 - GGUF loading/parsing works. Some models can enter a minimal
   `GENERATIVE-PREVIEW` path that attempts the first generated token, but full

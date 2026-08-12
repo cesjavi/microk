@@ -62,6 +62,26 @@ void keyboard_handler() {
     }
 }
 
+static void kbd_wait_input_clear() {
+    for (int i = 0; i < 100000; i++) {
+        if (!(inb(0x64) & 0x02)) return;
+    }
+}
+
+static void kbd_send_device_byte(uint8_t val) {
+    kbd_wait_input_clear();
+    outb(0x60, val);
+}
+
+static void kbd_wait_ack() {
+    for (int i = 0; i < 100000; i++) {
+        if (inb(0x64) & 0x01) {
+            inb(0x60); // consume ACK (0xFA) or whatever the device sent; don't hang on a nonstandard reply
+            return;
+        }
+    }
+}
+
 void keyboard_init() {
     // Disable devices
     outb(0x64, 0xAD);
@@ -72,13 +92,30 @@ void keyboard_init() {
 
     // Enable keyboard
     outb(0x64, 0xAE);
-    
+
     // Enable interrupts in controller
     outb(0x64, 0x20); // Command: read configuration
     uint8_t config = inb(0x60);
     config |= 0x01;   // Bit 0: enable interrupt
     outb(0x64, 0x60); // Command: write configuration
     outb(0x60, config);
+
+    // Slow down hardware key-repeat (0xF3 = Set Typematic Rate/Delay).
+    // keyboard_handler() sets last_char on every make-code with no
+    // debounce, so it relies on the PS/2 device's own repeat pacing to
+    // avoid flooding the shell's line buffer. The controller's power-on
+    // default can repeat as fast as ~30Hz after only a 250ms delay -- fine
+    // under QEMU where test input was short discrete keystrokes, but a
+    // normal human keypress under VirtualBox's PS/2 emulation can register
+    // as several repeats before the key is released (e.g. "s" -> "ssss").
+    // 0x7F = slowest rate (~2Hz) with the longest delay (1000ms) before
+    // repeat kicks in. Polled directly (no IRQs enabled globally yet at
+    // this point in boot), same reasoning as the timer-tick traps already
+    // documented for UHCI/net init in ROADMAP.md.
+    kbd_send_device_byte(0xF3);
+    kbd_wait_ack();
+    kbd_send_device_byte(0x7F);
+    kbd_wait_ack();
 
     serial_puts("KBD: HW Initialized and Unmasked\n");
 }

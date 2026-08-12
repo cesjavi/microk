@@ -14,7 +14,7 @@ LDFLAGS = -m elf_i386 -T kernel/linker.ld
 KERNEL_BIN = build/kernel.bin
 OBJ = kernel/boot.o kernel/main.o kernel/boot_modules.o kernel/shell.o kernel/gdt.o kernel/idt.o kernel/interrupts.o kernel/timer.o kernel/pmm.o kernel/vmm.o kernel/vmm_pae.o kernel/highmem.o kernel/ipc.o kernel/task.o kernel/syscall.o kernel/keyboard.o kernel/llm.o kernel/llm_gguf.o kernel/tensor.o kernel/tokenizer.o lib/string.o lib/math.o kernel/kheap.o kernel/vfs.o kernel/blockdev.o kernel/ata.o kernel/uhci.o kernel/partition.o kernel/storage.o kernel/extfs.o kernel/ntfs.o kernel/fat32.o kernel/pci.o kernel/gpu.o kernel/net.o kernel/initrd.o kernel/video.o kernel/speaker.o kernel/font.o kernel/serial.o kernel/ai_hooks.o kernel/spinlock.o
 
-.PHONY: all test-model test-netcfg clean image-mklm image-gguf image-net image-ext2 image-usb qemu qemu-gguf qemu-stories15 qemu-net qemu-nvidia qemu-highmem qemu-ext2 qemu-usb
+.PHONY: all test-model test-netcfg clean image-mklm image-gguf image-net image-ext2 image-usb iso qemu qemu-gguf qemu-stories15 qemu-net qemu-nvidia qemu-highmem qemu-ext2 qemu-usb
 
 all: $(KERNEL_BIN)
 
@@ -48,7 +48,33 @@ $(KERNEL_BIN): $(OBJ)
 	$(LD) $(LDFLAGS) $(OBJ) -o $@
 
 clean:
-	rm -rf build kernel/*.o lib/*.o storage.img storage-ext2.img usbstick.img model.mklm net.cfg
+	rm -rf build kernel/*.o lib/*.o storage.img storage-ext2.img usbstick.img model.mklm net.cfg microk.iso
+
+ISO_DIR = build/iso
+KERNEL_BIOS_BIN = build/kernel-bios.bin
+BIOS_OBJ = kernel/boot_bios.o $(filter-out kernel/boot.o,$(OBJ))
+
+# Built with MICROK_NO_VIDEO_MODE (see kernel/boot.asm): GRUB on
+# VirtualBox/real BIOS chokes on the normal build's VBE mode request, so the
+# ISO gets its own kernel binary with that request dropped. QEMU keeps using
+# the regular $(KERNEL_BIN) via -kernel, unaffected.
+kernel/boot_bios.o: kernel/boot.asm
+	$(AS) -f elf32 -DMICROK_NO_VIDEO_MODE $< -o $@
+
+$(KERNEL_BIOS_BIN): $(BIOS_OBJ)
+	mkdir -p build
+	$(LD) $(LDFLAGS) $(BIOS_OBJ) -o $@
+
+# GRUB2 rescue ISO for VirtualBox / real BIOS-CSM hardware (no -kernel flag
+# there, unlike QEMU) - see "Roadmap de Arranque en Hardware Real" in
+# ROADMAP.md. GRUB chainloads kernel-bios.bin as plain Multiboot v1, no
+# further changes needed. Requires grub-pc-bin + xorriso (grub-mkrescue) on
+# the host building the ISO; not needed just to run `make qemu*`.
+iso: $(KERNEL_BIOS_BIN)
+	mkdir -p $(ISO_DIR)/boot/grub
+	cp $(KERNEL_BIOS_BIN) $(ISO_DIR)/boot/kernel.bin
+	printf 'set timeout=0\nset default=0\n\nmenuentry "MicroK" {\n\tmultiboot /boot/kernel.bin\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
+	grub-mkrescue -o microk.iso $(ISO_DIR)
 
 image-mklm: $(KERNEL_BIN)
 	$(PYTHON) scripts/make_mklm_model.py model.mklm --name test-model \
