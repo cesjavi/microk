@@ -80,10 +80,7 @@ static int ata_read_sector(ata_drive_t *drive, uint32_t lba, uint8_t *buffer) {
 
     if (ata_wait_drq(drive) != 0) return -1;
 
-    uint16_t *words = (uint16_t *)buffer;
-    for (int i = 0; i < 256; i++) {
-        words[i] = inw(drive->io_base + ATA_REG_DATA);
-    }
+    insw(drive->io_base + ATA_REG_DATA, buffer, 256);
     ata_io_wait(drive);
     return 0;
 }
@@ -102,10 +99,7 @@ static int ata_write_sector(ata_drive_t *drive, uint32_t lba, uint8_t *buffer) {
 
     if (ata_wait_drq(drive) != 0) return -1;
 
-    uint16_t *words = (uint16_t *)buffer;
-    for (int i = 0; i < 256; i++) {
-        outw(drive->io_base + ATA_REG_DATA, words[i]);
-    }
+    outsw(drive->io_base + ATA_REG_DATA, buffer, 256);
     ata_io_wait(drive);
 
     if (ata_wait_ready(drive) != 0) return -1;

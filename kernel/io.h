@@ -33,4 +33,19 @@ static inline uint32_t inl(uint16_t port) {
     return ret;
 }
 
+// Bulk port I/O via REP INSW/OUTSW: one repeated instruction instead of a
+// manual per-word loop of inw()/outw(). Under software emulation (QEMU TCG)
+// this barely matters, but under hardware virtualization (VT-x/AMD-V) each
+// individual in/out is its own VM-exit, while REP INSW/OUTSW is handled by
+// the hypervisor as (at most) a handful of exits for the whole block -- the
+// standard real-world fix for exactly the ATA PIO slowness documented in
+// ROADMAP.md's "Arranque en Hardware Real" findings.
+static inline void insw(uint16_t port, void *addr, uint32_t count) {
+    asm volatile ( "rep insw" : "+D"(addr), "+c"(count) : "d"(port) : "memory" );
+}
+
+static inline void outsw(uint16_t port, const void *addr, uint32_t count) {
+    asm volatile ( "rep outsw" : "+S"(addr), "+c"(count) : "d"(port) : "memory" );
+}
+
 #endif
