@@ -284,6 +284,27 @@ static int llm_generation_timed_out(uint32_t start_ticks) {
 
 static int llm_generation_cancelled(uint32_t start_ticks) {
     extern int sys_abort_requested();
+    // int 0x80 (kernel/interrupts.asm, isr128) is an interrupt gate: the CPU
+    // clears IF on entry and nothing re-enables it until the syscall's own
+    // iret, so a long-running syscall like GGUF generation runs with IRQs
+    // globally masked for its entire duration. That silently broke both
+    // Ctrl+C abort and the tick-based timeout below -- sys_abort_requested()
+    // can never observe a keypress (IRQ1 can't fire to set it) and
+    // timer_get_ticks() never advances (IRQ0 can't fire either), for as
+    // long as generation runs. Went unnoticed under QEMU; surfaced on real
+    // hardware/VirtualBox as "[LLM Report] Generated N tokens in 0 ms."
+    // (ticks frozen) and, more visibly, the host's PS/2 keyboard emulation
+    // erroring with VERR_PDM_NO_QUEUE_ITEMS -- typed keys queue up waiting
+    // for the guest to drain IRQ1 and eventually overflow VirtualBox's
+    // internal delivery queue. This is checked from every hot loop in the
+    // forward pass/vocab scan already (see call sites below), so a single
+    // one-instruction interrupt window here -- STI, one instruction inside
+    // the guaranteed post-STI shadow, then CLI -- gives pending IRQ0/IRQ1 a
+    // chance to actually run each time, without making syscalls preemptible
+    // in general (every other syscall keeps the prior atomic-for-its-
+    // duration behavior; this only touches the one path known to run long
+    // enough for it to matter).
+    asm volatile("sti\n\tnop\n\tcli" ::: "memory");
     return sys_abort_requested() || llm_generation_timed_out(start_ticks);
 }
 
