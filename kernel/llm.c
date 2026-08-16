@@ -1174,7 +1174,9 @@ static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_
                 klog("LLM error: attn_norm rmsnorm failed\n");
                 return 0;
             }
-            
+
+            if (layer == 0) llm_debug_tensor_energy("L0 attn_norm rmsnorm-out", llm_ctx.scratch->data, n_embd);
+
             // Convert normalized state to float
             for (uint32_t d = 0; d < n_embd; d++) {
                 h_float[d] = (float)llm_ctx.scratch->data[d] / 65536.0f;
