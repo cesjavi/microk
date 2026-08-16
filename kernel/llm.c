@@ -1997,6 +1997,119 @@ static void llm_dump_top_logits(const char *prompt, char *response) {
                 continue;
             }
             logit = dot_product_q6_k_float(scratch, h_float, n_embd);
+            {
+                /* LLM DIAG v1: extends the original v==0 differential check
+                 * (fused dot_product_q6_k_float vs. dequantize_q6_k + manual
+                 * dot product) to the actual offending rows from the
+                 * "hello" top-5 (5489/8168/5917/5959/8232, see ROADMAP.md
+                 * Etapa 10), plus row 0 as a known-sane control. Also dumps
+                 * per-superblock raw d_f16/d/sc[] so a wrong-bytes-read bug
+                 * (offset/stride) can be told apart from a pure-math bug by
+                 * comparing against the same bytes read independently in
+                 * Python at the identical offset formula
+                 * (data_offset + tensor.offset + v*row_bytes). */
+                static const uint32_t llm_diag_rows[] = {0, 5489, 8168, 5917, 5959, 8232, 26000};
+                int is_diag_row = 0;
+                for (uint32_t di = 0; di < sizeof(llm_diag_rows) / sizeof(llm_diag_rows[0]); di++) {
+                    if (llm_diag_rows[di] == v) { is_diag_row = 1; break; }
+                }
+                if (is_diag_row && llm_trace_on) {
+                    dequantize_q6_k(llm_ctx.scratch->data, scratch, n_embd);
+                    float cross_logit = 0.0f;
+                    for (uint32_t d = 0; d < n_embd; d++) {
+                        cross_logit += h_float[d] * ((float)llm_ctx.scratch->data[d] / 65536.0f);
+                    }
+                    /* Address/offset trace: lets this be compared byte-for-byte
+                     * against an independent Python read of the raw .gguf file
+                     * at the same file-relative offset (data_offset +
+                     * tensor.offset + v*row_bytes) to tell a wrong-bytes-read
+                     * bug (offset/paging/PAE) apart from a pure-math bug. */
+                    char dbg0[200];
+                    uint32_t dp0 = 0;
+                    append_str(dbg0, &dp0, sizeof(dbg0), "LLM DIAG v1 addr row=");
+                    append_u32(dbg0, &dp0, sizeof(dbg0), v);
+                    append_str(dbg0, &dp0, sizeof(dbg0), " model_start=");
+                    append_u32(dbg0, &dp0, sizeof(dbg0), llm_model.start);
+                    append_str(dbg0, &dp0, sizeof(dbg0), " data_offset=");
+                    append_u32(dbg0, &dp0, sizeof(dbg0), llm_model.gguf.data_offset);
+                    append_str(dbg0, &dp0, sizeof(dbg0), " tensor_offset=");
+                    append_u32(dbg0, &dp0, sizeof(dbg0), out_tensor_info.offset);
+                    append_str(dbg0, &dp0, sizeof(dbg0), " row_byte_off=");
+                    append_u32(dbg0, &dp0, sizeof(dbg0), out_tensor_info.offset + v * row_bytes);
+                    append_str(dbg0, &dp0, sizeof(dbg0), " phys_addr=");
+                    append_u32(dbg0, &dp0, sizeof(dbg0), llm_model.start + llm_model.gguf.data_offset + out_tensor_info.offset + v * row_bytes);
+                    append_str(dbg0, &dp0, sizeof(dbg0), " model_size=");
+                    append_u32(dbg0, &dp0, sizeof(dbg0), llm_model.size);
+                    append_str(dbg0, &dp0, sizeof(dbg0), "\n");
+                    klog(dbg0);
+
+                    /* Raw bytes 0..15 of the row (first block's d_f16 + first
+                     * 14 ql bytes) as hex, one byte per token, for a direct
+                     * byte-for-byte diff against Python's read of the same
+                     * file-relative offset. */
+                    char dbgraw[160];
+                    uint32_t dpr = 0;
+                    append_str(dbgraw, &dpr, sizeof(dbgraw), "LLM DIAG v1 rawbytes row=");
+                    append_u32(dbgraw, &dpr, sizeof(dbgraw), v);
+                    append_str(dbgraw, &dpr, sizeof(dbgraw), ":");
+                    for (int rb = 0; rb < 16; rb++) {
+                        char hex[4];
+                        itoa((int)scratch[rb], hex, 16);
+                        uint32_t hlen = 0;
+                        while (hex[hlen]) hlen++;
+                        append_str(dbgraw, &dpr, sizeof(dbgraw), " ");
+                        if (hlen < 2) append_str(dbgraw, &dpr, sizeof(dbgraw), "0");
+                        append_str(dbgraw, &dpr, sizeof(dbgraw), hex);
+                    }
+                    append_str(dbgraw, &dpr, sizeof(dbgraw), "\n");
+                    klog(dbgraw);
+
+                    char dbg[160];
+                    uint32_t dpos = 0;
+                    append_str(dbg, &dpos, sizeof(dbg), "LLM DIAG v1 row=");
+                    append_u32(dbg, &dpos, sizeof(dbg), v);
+                    append_str(dbg, &dpos, sizeof(dbg), " fused_logit=");
+                    append_float3(dbg, &dpos, sizeof(dbg), logit);
+                    append_str(dbg, &dpos, sizeof(dbg), " dequant_logit=");
+                    append_float3(dbg, &dpos, sizeof(dbg), cross_logit);
+                    append_str(dbg, &dpos, sizeof(dbg), "\n");
+                    klog(dbg);
+
+                    uint32_t blocks_per_row_diag = n_embd / 256;
+                    for (uint32_t b = 0; b < blocks_per_row_diag; b++) {
+                        const uint8_t *block = scratch + b * 210;
+                        const int8_t *sc = (const int8_t *)(block + 192);
+                        uint16_t d_f16b = *(const uint16_t *)(block + 208);
+                        float db = f16_to_float_fast(d_f16b);
+                        int8_t sc_min = sc[0], sc_max = sc[0];
+                        for (int si = 1; si < 16; si++) {
+                            if (sc[si] < sc_min) sc_min = sc[si];
+                            if (sc[si] > sc_max) sc_max = sc[si];
+                        }
+                        char dbg2[160];
+                        uint32_t dp2 = 0;
+                        append_str(dbg2, &dp2, sizeof(dbg2), "  blk=");
+                        append_u32(dbg2, &dp2, sizeof(dbg2), b);
+                        append_str(dbg2, &dp2, sizeof(dbg2), " d_f16=0x");
+                        {
+                            char hex[8];
+                            itoa((int)d_f16b, hex, 16);
+                            uint32_t hlen = 0;
+                            while (hex[hlen]) hlen++;
+                            for (uint32_t pad = hlen; pad < 4; pad++) append_str(dbg2, &dp2, sizeof(dbg2), "0");
+                            append_str(dbg2, &dp2, sizeof(dbg2), hex);
+                        }
+                        append_str(dbg2, &dp2, sizeof(dbg2), " d=");
+                        append_float3(dbg2, &dp2, sizeof(dbg2), db);
+                        append_str(dbg2, &dp2, sizeof(dbg2), " sc_min=");
+                        append_u32(dbg2, &dp2, sizeof(dbg2), (uint32_t)(int32_t)sc_min);
+                        append_str(dbg2, &dp2, sizeof(dbg2), " sc_max=");
+                        append_u32(dbg2, &dp2, sizeof(dbg2), (uint32_t)(int32_t)sc_max);
+                        append_str(dbg2, &dp2, sizeof(dbg2), "\n");
+                        klog(dbg2);
+                    }
+                }
+            }
         } else {
             if (!llm_read_gguf_tensor_alias_row(llm_alias_output, "output", v, llm_ctx.scratch->data, n_embd)) {
                 continue;
