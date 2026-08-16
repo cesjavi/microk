@@ -109,12 +109,22 @@ void dequantize_q4_0(fixed_t *out, const uint8_t *in, uint32_t count) {
         fixed_t delta = float_to_fixed(f16_to_float(delta_f16)); 
         
         const uint8_t *qs = block + 2;
+        /* ggml Q4_0 packing: byte i holds elements i (low nibble) and i+16
+         * (high nibble) of the 32-element block -- a split-half layout, not
+         * sequential pairs. Verified against ggml's reference
+         * quantize_row_q4_0/dequantize_row_q4_0. Getting this wrong doesn't
+         * just rescale the result: it dot-products each weight against the
+         * wrong input dimension, so instead of the coherent sum a correct
+         * projection produces, unrelated terms partially cancel out --
+         * exactly the ~100-600x energy deficit seen when comparing MicroK's
+         * Q4_0 projections against a llama.cpp reference on the same
+         * weights (see ROADMAP.md, TinyLlama coherence investigation). */
         for (uint32_t i = 0; i < 16; i++) {
             uint8_t q0 = qs[i] & 0x0F;
             uint8_t q1 = qs[i] >> 4;
-            
-            out[b * 32 + i * 2 + 0] = fixed_mul(delta, int_to_fixed((int)q0 - 8));
-            out[b * 32 + i * 2 + 1] = fixed_mul(delta, int_to_fixed((int)q1 - 8));
+
+            out[b * 32 + i]      = fixed_mul(delta, int_to_fixed((int)q0 - 8));
+            out[b * 32 + i + 16] = fixed_mul(delta, int_to_fixed((int)q1 - 8));
         }
     }
 }

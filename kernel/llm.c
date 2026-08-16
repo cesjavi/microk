@@ -941,17 +941,17 @@ static float dot_product_q4_0_float(const uint8_t *block_row, const float *h_flo
 
         const uint8_t *qs = block + 2;
         const float *h_ptr = h_float + (b * 32);
-        
-        // Manual unrolling for 32 elements per block
-        // We process 4 elements at a time to keep the FPU pipeline full
-        for (uint32_t i = 0; i < 16; i += 2) {
+
+        /* ggml Q4_0 packing: byte i holds elements i (low nibble) and i+16
+         * (high nibble) -- see the matching fix/comment in
+         * dequantize_q4_0() (kernel/tensor.c). This used to pair each
+         * byte's two nibbles with ADJACENT input elements (h_ptr[2i],
+         * h_ptr[2i+1]) instead of the correct i/i+16 split, silently
+         * dot-producting every weight against the wrong input dimension. */
+        for (uint32_t i = 0; i < 16; i++) {
             uint8_t q_raw = qs[i];
-            logit += delta * (float)((int)(q_raw & 0x0F) - 8) * h_ptr[i*2+0];
-            logit += delta * (float)((int)(q_raw >> 4) - 8) * h_ptr[i*2+1];
-            
-            q_raw = qs[i+1];
-            logit += delta * (float)((int)(q_raw & 0x0F) - 8) * h_ptr[i*2+2];
-            logit += delta * (float)((int)(q_raw >> 4) - 8) * h_ptr[i*2+3];
+            logit += delta * (float)((int)(q_raw & 0x0F) - 8) * h_ptr[i];
+            logit += delta * (float)((int)(q_raw >> 4) - 8) * h_ptr[i + 16];
         }
     }
     return logit;
