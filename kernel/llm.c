@@ -1182,6 +1182,17 @@ static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_
                 h_float[d] = (float)llm_ctx.scratch->data[d] / 65536.0f;
             }
 
+            // Rotary Positional Embeddings (RoPE) dims, needed before the K/V
+            // projections below so the debug energy probes can use the
+            // correct kv_dim width instead of n_embd (llm_ctx.k/v only hold
+            // kv_dim meaningful elements before they're cached; the rest of
+            // the buffer is stale data from a previous call).
+            uint32_t n_head = llm_model.gguf.arch.n_head;
+            uint32_t head_dim = n_embd / n_head;
+            uint32_t n_kv_head = llm_effective_n_kv_head(n_head);
+            uint32_t kv_dim = n_kv_head * head_dim;
+            uint32_t group_size = n_head / n_kv_head; /* query heads sharing each KV head */
+
             // Project Q, K, V
             llama_matmul_fpu(llm_ctx.q, llm_ctx.scratch, llm_weights.layers[layer].attn_q, h_float);
             if (llm_generation_cancelled(start_ticks)) return 0;
@@ -1191,13 +1202,9 @@ static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_
             if (llm_generation_cancelled(start_ticks)) return 0;
 
             if (layer == 0) llm_debug_tensor_energy("L0 q post-proj", llm_ctx.q->data, n_embd);
+            if (layer == 0) llm_debug_tensor_energy("L0 k post-proj", llm_ctx.k->data, kv_dim);
+            if (layer == 0) llm_debug_tensor_energy("L0 v post-proj", llm_ctx.v->data, kv_dim);
 
-            // Rotary Positional Embeddings (RoPE)
-            uint32_t n_head = llm_model.gguf.arch.n_head;
-            uint32_t head_dim = n_embd / n_head;
-            uint32_t n_kv_head = llm_effective_n_kv_head(n_head);
-            uint32_t kv_dim = n_kv_head * head_dim;
-            uint32_t group_size = n_head / n_kv_head; /* query heads sharing each KV head */
             tensor_rope(llm_ctx.q, llm_ctx.current_pos, n_head, head_dim);
             tensor_rope(llm_ctx.k, llm_ctx.current_pos, n_kv_head, head_dim);
 
