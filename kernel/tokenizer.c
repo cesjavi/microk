@@ -81,6 +81,45 @@ tokenizer_t *tokenizer_create(uint32_t file_start, uint32_t file_size) {
         }
     }
 
+    /* tokenizer.ggml.token_type: one int32 per vocab entry (GGUF/llama.cpp
+     * convention: 1=NORMAL, 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED, 5=UNUSED,
+     * 6=BYTE). CONTROL entries (<s>, </s>, <unk>, ...) are special tokens
+     * added directly to the vocab rather than learned through incremental
+     * BPE merges, so no amount of pairwise merging in tokenizer_encode() can
+     * ever produce them -- they have to be matched as literal substrings
+     * before the merge loop runs. Optional, same graceful-degradation
+     * pattern as scores above: older/simpler GGUF files (e.g. the
+     * llama2.c-style stories15M fixture) that omit this array just get no
+     * special-token handling, same behavior as before this field existed.
+     */
+    t->special_ids = NULL;
+    t->special_count = 0;
+    {
+        uint32_t type_count = 0;
+        uint8_t *type_ptr = NULL;
+        if (gguf_get_metadata_array(file_start, file_size, "tokenizer.ggml.token_type", &type_count, &type_ptr) &&
+            type_count == count && type_ptr &&
+            type_ptr + (uint64_t)count * 4 <= file_end) {
+            uint32_t *ids = kmalloc(count * sizeof(uint32_t));
+            if (ids) {
+                uint32_t n = 0;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t ttype;
+                    memcpy(&ttype, type_ptr + (uint32_t)i * 4, 4);
+                    if (ttype == 3 /* CONTROL */) {
+                        ids[n++] = i;
+                    }
+                }
+                if (n > 0) {
+                    t->special_ids = ids;
+                    t->special_count = n;
+                } else {
+                    kfree(ids);
+                }
+            }
+        }
+    }
+
     return t;
 }
 
@@ -97,7 +136,29 @@ void tokenizer_free(tokenizer_t *t) {
     }
     if (t->lengths) kfree(t->lengths);
     if (t->scores) kfree(t->scores);
+    if (t->special_ids) kfree(t->special_ids);
     kfree(t);
+}
+
+/* Longest exact match among special (CONTROL-type) vocab entries starting
+ * at text[0..avail). Longest-match-first avoids a short special token
+ * shadowing a longer one that also matches at the same position (not known
+ * to happen with today's fixtures, but cheap to get right). Returns the
+ * vocab id, or -1 if none match. */
+static int tokenizer_find_special_at(tokenizer_t *t, const char *text, uint32_t avail) {
+    int best_tok = -1;
+    uint32_t best_len = 0;
+    for (uint32_t k = 0; k < t->special_count; k++) {
+        uint32_t idx = t->special_ids[k];
+        uint32_t len = t->lengths[idx];
+        if (len == 0 || len > avail) continue;
+        if (len <= best_len) continue; /* can't beat current best */
+        if (memcmp(t->tokens[idx], text, len) == 0) {
+            best_tok = (int)idx;
+            best_len = len;
+        }
+    }
+    return best_tok;
 }
 
 /* Exact-match vocab lookup by (pointer, length) -- no NUL-termination
@@ -145,6 +206,9 @@ typedef struct {
     uint32_t len;
     int prev;
     int next;
+    int forced_token; /* -1, or a vocab id already resolved (special/control
+                        * token) that must be emitted as-is and never merged
+                        * with a neighboring symbol */
 } bpe_symbol_t;
 
 /**
@@ -194,12 +258,19 @@ int tokenizer_encode(tokenizer_t *t, const char *text, uint32_t *tokens, uint32_
     int n_symbols = 0;
     uint32_t pos = 0;
     while (pos < epos && n_symbols < TOKENIZER_MAX_SYMBOLS) {
-        int clen = utf8_char_len((unsigned char)encoded[pos]);
-        if (pos + (uint32_t)clen > epos) clen = (int)(epos - pos);
+        int forced = t->special_count ? tokenizer_find_special_at(t, encoded + pos, epos - pos) : -1;
+        int clen;
+        if (forced >= 0) {
+            clen = (int)t->lengths[forced];
+        } else {
+            clen = utf8_char_len((unsigned char)encoded[pos]);
+            if (pos + (uint32_t)clen > epos) clen = (int)(epos - pos);
+        }
         symbols[n_symbols].offset = pos;
         symbols[n_symbols].len = (uint32_t)clen;
         symbols[n_symbols].prev = n_symbols - 1;
         symbols[n_symbols].next = n_symbols + 1;
+        symbols[n_symbols].forced_token = forced;
         pos += (uint32_t)clen;
         n_symbols++;
     }
@@ -208,7 +279,11 @@ int tokenizer_encode(tokenizer_t *t, const char *text, uint32_t *tokens, uint32_
     /* Repeatedly merge the best-scoring adjacent pair that forms a known
      * vocab entry. n_symbols is small (bounded by prompt length), so
      * rescanning all active pairs each round is simple and fast enough --
-     * this runs once per prompt, not once per generated token. */
+     * this runs once per prompt, not once per generated token. Symbols
+     * already resolved to a special/control token (forced_token >= 0) are
+     * skipped as merge candidates: they were never reached through
+     * pairwise merges during training, so merging them with a neighbor
+     * would only ever produce a nonexistent or wrong vocab entry. */
     while (1) {
         int best_i = -1;
         float best_score = 0.0f;
@@ -217,6 +292,7 @@ int tokenizer_encode(tokenizer_t *t, const char *text, uint32_t *tokens, uint32_
         for (int i = 0; i != -1; i = symbols[i].next) {
             int j = symbols[i].next;
             if (j == -1) break;
+            if (symbols[i].forced_token >= 0 || symbols[j].forced_token >= 0) continue;
             uint32_t merged_len = symbols[i].len + symbols[j].len;
             int tok = tokenizer_find_exact(t, encoded + symbols[i].offset, merged_len);
             if (tok < 0) continue;
@@ -238,12 +314,17 @@ int tokenizer_encode(tokenizer_t *t, const char *text, uint32_t *tokens, uint32_
         }
     }
 
-    /* Emit one token per final symbol -- an exact vocab match if the merge
-     * loop above found one (it always did for anything merged past a
-     * single character), otherwise fall back to per-byte <0xXX> tokens
-     * instead of silently dropping the character. */
+    /* Emit one token per final symbol: the pre-resolved special token if
+     * this symbol came from tokenizer_find_special_at(), otherwise an exact
+     * vocab match if the merge loop above found one (it always did for
+     * anything merged past a single character), otherwise fall back to
+     * per-byte <0xXX> tokens instead of silently dropping the character. */
     uint32_t token_count = 0;
     for (int i = 0; i != -1 && token_count < max_tokens; i = symbols[i].next) {
+        if (symbols[i].forced_token >= 0) {
+            tokens[token_count++] = (uint32_t)symbols[i].forced_token;
+            continue;
+        }
         const char *sym_text = encoded + symbols[i].offset;
         uint32_t sym_len = symbols[i].len;
         int tok = tokenizer_find_exact(t, sym_text, sym_len);
