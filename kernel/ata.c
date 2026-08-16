@@ -66,47 +66,67 @@ static int ata_wait_drq(ata_drive_t *drive) {
     return -1;
 }
 
-static int ata_read_sector(ata_drive_t *drive, uint32_t lba, uint8_t *buffer) {
-    if (!drive->present || !buffer) return -1;
+/* SECCOUNT0 is 8 bits and 0 means "256" on classic PIO commands -- capping
+ * at 255 per command avoids that special case; callers loop for bigger
+ * requests. Batching the select/LBA/command-issue overhead (~10-20 port
+ * accesses) across up to 255 sectors instead of paying it once per 512-byte
+ * sector is the remaining optimization noted after the insw/outsw fix
+ * (Roadmap de Arranque en Hardware Real, Etapa 0): DRQ still asserts once
+ * per sector for plain READ/WRITE SECTORS (unlike READ/WRITE MULTIPLE),
+ * but the per-command setup only happens once for the whole batch. */
+#define ATA_MAX_SECTORS_PER_CMD 255
+
+static int ata_read_sectors(ata_drive_t *drive, uint32_t lba, uint32_t count, uint8_t *buffer) {
+    if (!drive->present || !buffer || count == 0 || count > ATA_MAX_SECTORS_PER_CMD) return -1;
     if (ata_wait_ready(drive) != 0) return -1;
 
     outb(drive->io_base + ATA_REG_HDDEVSEL, drive->drive_select | ((lba >> 24) & 0x0F));
     ata_io_wait(drive);
-    outb(drive->io_base + ATA_REG_SECCOUNT0, 1);
+    outb(drive->io_base + ATA_REG_SECCOUNT0, (uint8_t)count);
     outb(drive->io_base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
     outb(drive->io_base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
     outb(drive->io_base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
     outb(drive->io_base + ATA_REG_COMMAND, ATA_CMD_READ_PIO);
 
-    if (ata_wait_drq(drive) != 0) return -1;
-
-    insw(drive->io_base + ATA_REG_DATA, buffer, 256);
+    for (uint32_t i = 0; i < count; i++) {
+        if (ata_wait_drq(drive) != 0) return -1;
+        insw(drive->io_base + ATA_REG_DATA, buffer + (uint32_t)i * 512, 256);
+    }
     ata_io_wait(drive);
     return 0;
 }
 
-static int ata_write_sector(ata_drive_t *drive, uint32_t lba, uint8_t *buffer) {
-    if (!drive->present || !buffer) return -1;
+static int ata_write_sectors(ata_drive_t *drive, uint32_t lba, uint32_t count, uint8_t *buffer) {
+    if (!drive->present || !buffer || count == 0 || count > ATA_MAX_SECTORS_PER_CMD) return -1;
     if (ata_wait_ready(drive) != 0) return -1;
 
     outb(drive->io_base + ATA_REG_HDDEVSEL, drive->drive_select | ((lba >> 24) & 0x0F));
     ata_io_wait(drive);
-    outb(drive->io_base + ATA_REG_SECCOUNT0, 1);
+    outb(drive->io_base + ATA_REG_SECCOUNT0, (uint8_t)count);
     outb(drive->io_base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
     outb(drive->io_base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
     outb(drive->io_base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
     outb(drive->io_base + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO);
 
-    if (ata_wait_drq(drive) != 0) return -1;
-
-    outsw(drive->io_base + ATA_REG_DATA, buffer, 256);
-    ata_io_wait(drive);
+    for (uint32_t i = 0; i < count; i++) {
+        if (ata_wait_drq(drive) != 0) return -1;
+        outsw(drive->io_base + ATA_REG_DATA, buffer + (uint32_t)i * 512, 256);
+        ata_io_wait(drive);
+    }
 
     if (ata_wait_ready(drive) != 0) return -1;
-    
+
     outb(drive->io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
     ata_wait_ready(drive);
     return 0;
+}
+
+static int ata_read_sector(ata_drive_t *drive, uint32_t lba, uint8_t *buffer) {
+    return ata_read_sectors(drive, lba, 1, buffer);
+}
+
+static int ata_write_sector(ata_drive_t *drive, uint32_t lba, uint8_t *buffer) {
+    return ata_write_sectors(drive, lba, 1, buffer);
 }
 
 static uint32_t ata_block_read(block_device_t *device, uint32_t offset, uint32_t size, uint8_t *buffer) {
@@ -119,10 +139,24 @@ static uint32_t ata_block_read(block_device_t *device, uint32_t offset, uint32_t
         uint32_t absolute = offset + done;
         uint32_t lba = absolute / 512;
         uint32_t sector_offset = absolute % 512;
-        uint32_t chunk = 512 - sector_offset;
-        if (chunk > size - done) chunk = size - done;
 
         if (lba >= drive->sectors) break;
+
+        if (sector_offset == 0 && size - done >= 512) {
+            /* Aligned run of one or more whole sectors: read them straight
+             * into the caller's buffer in a single batched ATA command
+             * instead of one command per sector. */
+            uint32_t batch = (size - done) / 512;
+            uint32_t avail = drive->sectors - lba;
+            if (batch > avail) batch = avail;
+            if (batch > ATA_MAX_SECTORS_PER_CMD) batch = ATA_MAX_SECTORS_PER_CMD;
+            if (ata_read_sectors(drive, lba, batch, buffer + done) != 0) break;
+            done += batch * 512;
+            continue;
+        }
+
+        uint32_t chunk = 512 - sector_offset;
+        if (chunk > size - done) chunk = size - done;
         if (ata_read_sector(drive, lba, sector) != 0) {
             break;
         }
@@ -142,19 +176,27 @@ static uint32_t ata_block_write(block_device_t *device, uint32_t offset, uint32_
         uint32_t absolute = offset + done;
         uint32_t lba = absolute / 512;
         uint32_t sector_offset = absolute % 512;
-        uint32_t chunk = 512 - sector_offset;
-        if (chunk > size - done) chunk = size - done;
 
         if (lba >= drive->sectors) break;
-        if (chunk < 512) {
-            // Partial write: read-modify-write
-            if (ata_read_sector(drive, lba, sector) != 0) break;
-            memcpy(sector + sector_offset, buffer + done, chunk);
-            if (ata_write_sector(drive, lba, sector) != 0) break;
-        } else {
-            // Full sector write
-            if (ata_write_sector(drive, lba, buffer + done) != 0) break;
+
+        if (sector_offset == 0 && size - done >= 512) {
+            /* Aligned run of one or more whole sectors: same batching as
+             * ata_block_read, straight from the caller's buffer. */
+            uint32_t batch = (size - done) / 512;
+            uint32_t avail = drive->sectors - lba;
+            if (batch > avail) batch = avail;
+            if (batch > ATA_MAX_SECTORS_PER_CMD) batch = ATA_MAX_SECTORS_PER_CMD;
+            if (ata_write_sectors(drive, lba, batch, buffer + done) != 0) break;
+            done += batch * 512;
+            continue;
         }
+
+        uint32_t chunk = 512 - sector_offset;
+        if (chunk > size - done) chunk = size - done;
+        // Partial write: read-modify-write
+        if (ata_read_sector(drive, lba, sector) != 0) break;
+        memcpy(sector + sector_offset, buffer + done, chunk);
+        if (ata_write_sector(drive, lba, sector) != 0) break;
         done += chunk;
     }
     return done;
