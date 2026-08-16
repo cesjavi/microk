@@ -919,25 +919,50 @@ static void llm_init_context(uint32_t n_embd, uint32_t n_head) {
     llm_ctx.current_pos = 0;
 }
 
+/* Correct F16->F32 conversion, including subnormals (exp==0, mantissa!=0):
+ * Q6_K/Q4_0 per-(super)block scale deltas are frequently subnormal-range
+ * f16 values for real trained weights (very small but genuinely nonzero,
+ * e.g. ~1e-5), not exact zero. A version of this used to short-circuit ANY
+ * exp==0 case to 0.0f (a common "fast but wrong" simplification) -- that
+ * silently zeroed out every dequantized value in any block whose scale
+ * happened to be subnormal instead of normal, which for output.weight's
+ * Q6_K blocks was frequent enough to blow up the final vocab logits to
+ * nonsensical magnitudes (see ROADMAP.md, TinyLlama coherence
+ * investigation: logits in the billions instead of the normal tens). */
+static float f16_to_float_fast(uint16_t h) {
+    union { uint32_t u; float f; } conv;
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x03FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 127 - 15 + 1;
+            while ((mant & 0x0400) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03FF;
+            bits = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        bits = sign | 0x7F800000 | (mant << 13);
+    } else {
+        bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+    conv.u = bits;
+    return conv.f;
+}
+
 static float dot_product_q4_0_float(const uint8_t *block_row, const float *h_float, uint32_t n) {
     register float logit = 0.0f;
     uint32_t nb = n / 32;
     for (uint32_t b = 0; b < nb; b++) {
         const uint8_t *block = block_row + b * 18;
         uint16_t delta_f16 = *(uint16_t *)block;
-        
-        // Fast F16 to F32
-        union { uint32_t u; float f; } conv;
-        uint32_t sign = (delta_f16 & 0x8000) << 16;
-        uint32_t exp = (delta_f16 >> 10) & 0x1F;
-        uint32_t mant = delta_f16 & 0x03FF;
-        float delta;
-        if (exp == 0) {
-            delta = 0.0f;
-        } else {
-            conv.u = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-            delta = conv.f;
-        }
+        float delta = f16_to_float_fast(delta_f16);
 
         const uint8_t *qs = block + 2;
         const float *h_ptr = h_float + (b * 32);
@@ -956,9 +981,6 @@ static float dot_product_q4_0_float(const uint8_t *block_row, const float *h_flo
     }
     return logit;
 }
-
-/* Forward declaration: defined right below, needed here too. */
-static float f16_to_float_fast(uint16_t h);
 
 /* Fused Q6_K dot product, mirroring dot_product_q4_0_float's approach: do
  * the dequant and the multiply-accumulate in a single pass instead of
@@ -999,18 +1021,6 @@ static float dot_product_q6_k_float(const uint8_t *block_row, const float *h_flo
         }
     }
     return logit;
-}
-
-static float f16_to_float_fast(uint16_t h) {
-    union { uint32_t u; float f; } conv;
-    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-    uint32_t exp = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x03FF;
-    if (exp == 0) {
-        return 0.0f; /* subnormal/zero -- same simplification dot_product_q4_0_float uses for the Q4_0 delta */
-    }
-    conv.u = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    return conv.f;
 }
 
 /* Reused row-scratch buffer for llama_matmul_fpu()/the vocab argmax scan --
@@ -2010,6 +2020,8 @@ static void llm_dump_top_logits(const char *prompt, char *response) {
         append_u32(out, &opos, sizeof(out), top[i].token);
         append_str(out, &opos, sizeof(out), " logit=");
         append_float3(out, &opos, sizeof(out), top[i].logit);
+        append_str(out, &opos, sizeof(out), " logit_millions=");
+        append_float3(out, &opos, sizeof(out), top[i].logit / 1000000.0f);
         append_str(out, &opos, sizeof(out), " text=\"");
         append_str(out, &opos, sizeof(out), disp);
         append_str(out, &opos, sizeof(out), "\"\n");
