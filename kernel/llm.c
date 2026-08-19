@@ -1167,6 +1167,19 @@ static void llm_debug_h_energy(const char *label, uint32_t n_embd) {
     klog(line);
 }
 
+/* float_to_fixed() truncates towards zero, so any eps below 1/65536
+ * (~1.5e-5) in Q16.16 collapses to exactly 0 -- true for every typical
+ * Llama rms_norm_eps (1e-5 or 1e-6), silently disabling RMSNorm's
+ * numerical-stability term for every model. Round tiny-but-nonzero eps up
+ * to the smallest representable positive value instead of losing it. */
+static fixed_t llm_rms_eps_fixed(float eps) {
+    fixed_t fx = float_to_fixed(eps);
+    if (fx == 0 && eps > 0.0f) {
+        fx = 1;
+    }
+    return fx;
+}
+
 static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_t n_embd, uint32_t start_ticks) {
     uint32_t n_layers = llm_model.gguf.arch.n_layer;
     if (n_layers > 32) n_layers = 32;
@@ -1180,7 +1193,7 @@ static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_
 
         // --- 1. ATTENTION PASS ---
         if (llm_weights.layers[layer].attn_norm && llm_weights.layers[layer].attn_q) {
-            if (!tensor_rmsnorm(llm_ctx.scratch, llm_ctx.h, llm_weights.layers[layer].attn_norm, float_to_fixed(llm_model.gguf.arch.rms_norm_eps))) {
+            if (!tensor_rmsnorm(llm_ctx.scratch, llm_ctx.h, llm_weights.layers[layer].attn_norm, llm_rms_eps_fixed(llm_model.gguf.arch.rms_norm_eps))) {
                 klog("LLM error: attn_norm rmsnorm failed\n");
                 return 0;
             }
@@ -1215,8 +1228,8 @@ static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_
             if (layer == 0) llm_debug_tensor_energy("L0 k post-proj", llm_ctx.k->data, kv_dim);
             if (layer == 0) llm_debug_tensor_energy("L0 v post-proj", llm_ctx.v->data, kv_dim);
 
-            tensor_rope(llm_ctx.q, llm_ctx.current_pos, n_head, head_dim);
-            tensor_rope(llm_ctx.k, llm_ctx.current_pos, n_kv_head, head_dim);
+            tensor_rope(llm_ctx.q, llm_ctx.current_pos, n_head, head_dim, llm_model.gguf.arch.rope_freq_base);
+            tensor_rope(llm_ctx.k, llm_ctx.current_pos, n_kv_head, head_dim, llm_model.gguf.arch.rope_freq_base);
 
             if (layer == 0) llm_debug_tensor_energy("L0 q post-rope", llm_ctx.q->data, n_embd);
 
@@ -1314,7 +1327,7 @@ static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_
             // Normalize h into scratch (same pattern as attn_norm above).
             // Previously had arguments swapped: (h, scratch) normalised scratch
             // (undefined at this point) and overwrote h, destroying the residual.
-            if (!tensor_rmsnorm(llm_ctx.scratch, llm_ctx.h, llm_weights.layers[layer].ffn_norm, float_to_fixed(llm_model.gguf.arch.rms_norm_eps))) {
+            if (!tensor_rmsnorm(llm_ctx.scratch, llm_ctx.h, llm_weights.layers[layer].ffn_norm, llm_rms_eps_fixed(llm_model.gguf.arch.rms_norm_eps))) {
                 klog("LLM error: ffn_norm rmsnorm failed\n");
                 return 0;
             }
@@ -1377,7 +1390,7 @@ static int run_llama_forward_pass(float *h_float, float *ffn_gate_float, uint32_
         }
     }
 
-    if (!tensor_rmsnorm(llm_ctx.h, llm_ctx.h, llm_weights.output_norm, float_to_fixed(llm_model.gguf.arch.rms_norm_eps))) {
+    if (!tensor_rmsnorm(llm_ctx.h, llm_ctx.h, llm_weights.output_norm, llm_rms_eps_fixed(llm_model.gguf.arch.rms_norm_eps))) {
         klog("LLM error: final output_norm rmsnorm failed\n");
         return 0;
     }

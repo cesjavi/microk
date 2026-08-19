@@ -43,6 +43,7 @@ typedef struct {
     uint32_t n_kv_head;
     uint32_t n_ctx;
     float rms_norm_eps;
+    float rope_freq_base;
 } gguf_arch_t;
 
 typedef struct {

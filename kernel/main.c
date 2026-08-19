@@ -217,6 +217,25 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     free_usable_memory(mbi, mem_size);
     pmm_reserve_region(0, bitmap_addr + pmm_get_bitmap_size());
     reserve_multiboot_modules(mbi);
+
+    klog("Initializing Kernel Heap...");
+    /* Must run before vmm_init()/pmm_init_high(): both call
+     * pmm_alloc_block()/pmm_alloc_region() to carve out their own pages
+     * (page tables, the high-memory bitmap) from the first free PMM
+     * blocks. Since [0, bitmap_addr+bitmap_size) -- kernel, every
+     * Multiboot module, and the PMM bitmap itself -- is already reserved
+     * above, "first free" starts right where this heap would otherwise
+     * go, and vmm_init() building page tables on top of live heap data
+     * (or vice versa) reliably page-faults the kernel. Reserving the
+     * heap's own 32MB here first makes every later low-block allocator
+     * skip over it automatically. bitmap_addr already sits past
+     * kernel_end AND every Multiboot module's mod_end (see
+     * reserve_kernel_and_modules() above); adding the PMM bitmap's own
+     * size clears the heap of that too, so a large GGUF model module can
+     * never overlap the heap window either. Fixes the kheap/model
+     * collision documented in ROADMAP.md Etapa 10. */
+    kheap_init(bitmap_addr + pmm_get_bitmap_size());
+
     pmm_init_high();
     pmm_record_boot_layout(
         bitmap_addr,
@@ -248,9 +267,6 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
 
     klog("Initializing Task Scheduler...");
     task_init();
-
-    klog("Initializing Kernel Heap...");
-    kheap_init();
 
     klog("Initializing VFS Filesystem Drivers...");
     register_filesystems();

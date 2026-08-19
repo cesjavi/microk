@@ -5,6 +5,7 @@
 #include "video.h"
 #include "vmm.h"
 #include "string.h"
+#include "io.h"
 
 #define E1000_MMIO_VMEM 0xFE000000
 
@@ -49,6 +50,68 @@
 #define E1000_TX_DESC_COUNT 8
 #define E1000_RX_BUF_SIZE 2048
 #define E1000_TX_BUF_SIZE 2048
+
+/* Realtek RTL8111/8168/8169 gigabit family ("Realtek PCIe GbE Family" in
+ * Windows Device Manager). Register layout, descriptor format and init
+ * sequence below are taken directly from the Linux r8169_main.c driver
+ * (drivers/net/ethernet/realtek/r8169_main.c) rather than guessed, but
+ * deliberately skip its per-mac_version quirk tables (rtl_hw_start_8168 etc.)
+ * -- those exist for power management / EEE / checksum-offload correctness
+ * across dozens of silicon revisions, not for basic RX/TX to work at all.
+ * This is a minimal, generic init path only. Unlike e1000, QEMU has no
+ * RTL8111/8168 model (only the older, differently-programmed RTL8139), so
+ * this driver cannot be exercised in the usual QEMU/VirtualBox test loop --
+ * it can only be verified on the real hardware it was written for. */
+#define RTL_VENDOR_REALTEK 0x10EC
+
+/* A separate 4 KB MMIO window from e1000's (0xFE000000..0xFE020000) so the
+ * two drivers' mappings never overlap, even though at most one is ever
+ * active per boot (a machine has one wired NIC, not both). */
+#define RTL_MMIO_VMEM 0xFE100000
+
+#define RTL_REG_MAC0        0x00 /* + MAC4 at 0x04: 6-byte station MAC */
+#define RTL_REG_TXDESC_LOW  0x20
+#define RTL_REG_TXDESC_HIGH 0x24
+#define RTL_REG_CHIPCMD     0x37
+#define RTL_REG_TXPOLL      0x38
+#define RTL_REG_TXCONFIG    0x40
+#define RTL_REG_RXCONFIG    0x44
+#define RTL_REG_CFG9346     0x50
+#define RTL_REG_RXMAXSIZE   0xDA
+#define RTL_REG_CPLUSCMD    0xE0
+#define RTL_REG_RXDESC_LOW  0xE4
+#define RTL_REG_RXDESC_HIGH 0xE8
+
+#define RTL_CMD_RESET  0x10
+#define RTL_CMD_RXENB  0x08
+#define RTL_CMD_TXENB  0x04
+
+#define RTL_CFG9346_UNLOCK 0xC0
+#define RTL_CFG9346_LOCK   0x00
+
+#define RTL_TXPOLL_NPQ 0x40 /* kick the (only) TX queue we use */
+
+#define RTL_RXCFG_ACCEPT_BROADCAST (1u << 3)
+#define RTL_RXCFG_ACCEPT_MULTICAST (1u << 2)
+#define RTL_RXCFG_ACCEPT_MYPHYS    (1u << 1)
+#define RTL_RXCFG_FIFO_UNLIMITED   (7u << 13)
+#define RTL_RXCFG_DMA_UNLIMITED    (7u << 8)
+
+#define RTL_TXCFG_DMA_UNLIMITED  (7u << 8)  /* TX_DMA_BURST=7 << TxDMAShift=8 */
+#define RTL_TXCFG_IFG_STANDARD   (3u << 24) /* InterFrameGap=3 << shift=24 */
+
+#define RTL_DESC_OWN       (1u << 31) /* set = descriptor still owned by NIC */
+#define RTL_DESC_RINGEND   (1u << 30)
+#define RTL_DESC_FIRSTFRAG (1u << 29)
+#define RTL_DESC_LASTFRAG  (1u << 28)
+#define RTL_DESC_LEN_MASK  0x3FFFu    /* low 14 bits: buffer/packet length */
+
+#define RTL_RX_ERROR_BIT (1u << 21)   /* RxRES */
+
+#define RTL_RX_DESC_COUNT 16
+#define RTL_TX_DESC_COUNT 8
+#define RTL_RX_BUF_SIZE 2048
+#define RTL_TX_BUF_SIZE 2048
 
 static net_config_t net_config;
 static char net_status_buf[256];
@@ -101,6 +164,28 @@ static e1000_rx_desc_t *e1000_rx_descs;
 static e1000_tx_desc_t *e1000_tx_descs;
 static uint8_t *e1000_rx_buffers;
 static uint8_t *e1000_tx_buffers;
+
+/* RTL8111/8168/8169 descriptor: same 3-field layout for RX and TX, opts1
+ * then opts2 then a 64-bit buffer address (note: address is LAST, unlike
+ * e1000_rx_desc_t/e1000_tx_desc_t above where addr comes first). Matches
+ * struct TxDesc/RxDesc in r8169_main.c exactly. */
+typedef struct {
+    uint32_t opts1;
+    uint32_t opts2;
+    uint64_t addr;
+} __attribute__((packed)) rtl_desc_t;
+
+static int rtl_rings_ready = 0;
+static uint32_t rtl_rx_cur = 0;
+static uint32_t rtl_tx_tail = 0;
+static rtl_desc_t *rtl_rx_descs;
+static rtl_desc_t *rtl_tx_descs;
+static uint8_t *rtl_rx_buffers;
+static uint8_t *rtl_tx_buffers;
+
+static inline int nic_rings_ready(void) {
+    return e1000_rings_ready || rtl_rings_ready;
+}
 
 typedef struct {
     uint8_t dest[6];
@@ -244,6 +329,35 @@ static inline void e1000_write(uint32_t reg, uint32_t value) {
     *(volatile uint32_t *)(uintptr_t)(E1000_MMIO_VMEM + reg) = value;
 }
 
+static inline uint8_t rtl_read8(uint32_t reg) {
+    return *(volatile uint8_t *)(uintptr_t)(RTL_MMIO_VMEM + reg);
+}
+static inline void rtl_write8(uint32_t reg, uint8_t value) {
+    *(volatile uint8_t *)(uintptr_t)(RTL_MMIO_VMEM + reg) = value;
+}
+static inline uint16_t rtl_read16(uint32_t reg) {
+    return *(volatile uint16_t *)(uintptr_t)(RTL_MMIO_VMEM + reg);
+}
+static inline void rtl_write16(uint32_t reg, uint16_t value) {
+    *(volatile uint16_t *)(uintptr_t)(RTL_MMIO_VMEM + reg) = value;
+}
+static inline uint32_t rtl_read32(uint32_t reg) {
+    return *(volatile uint32_t *)(uintptr_t)(RTL_MMIO_VMEM + reg);
+}
+static inline void rtl_write32(uint32_t reg, uint32_t value) {
+    *(volatile uint32_t *)(uintptr_t)(RTL_MMIO_VMEM + reg) = value;
+}
+
+/* net_detect_pci() runs before the scheduler's first task switch enables
+ * interrupts, so timer_get_ticks() never advances here -- same constraint
+ * kernel/uhci.c and kernel/ata.c hit, solved the same way: a pure I/O-port
+ * busy-wait instead of a timer-based one. */
+static void rtl_io_delay(uint32_t iterations) {
+    for (uint32_t i = 0; i < iterations; i++) {
+        inb(0x80);
+    }
+}
+
 /* ARP Packet format */
 typedef struct {
     uint16_t hw_type;
@@ -285,6 +399,17 @@ static void append_mac(char *out, uint32_t *pos, uint32_t max, const uint8_t mac
 static void append_hex8(char *out, uint32_t *pos, uint32_t max, uint8_t value);
 static void append_hex32(char *out, uint32_t *pos, uint32_t max, uint32_t value);
 static int e1000_send_frame(const uint8_t *frame, uint16_t len);
+static int rtl_send_frame(const uint8_t *frame, uint16_t len);
+
+/* Dispatches to whichever driver actually detected/initialized a NIC.
+ * At most one of e1000_rings_ready/rtl_rings_ready is ever set, since
+ * net_detect_pci() stops at the first supported device it finds. */
+static int nic_send_frame(const uint8_t *frame, uint16_t len) {
+    if (rtl_rings_ready) {
+        return rtl_send_frame(frame, len);
+    }
+    return e1000_send_frame(frame, len);
+}
 static void net_llm_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
                                  const uint8_t *payload, uint16_t len);
 static void dhcp_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
@@ -598,7 +723,7 @@ int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port
                  const uint8_t *payload, uint16_t payload_len) {
     uint8_t dest_mac[6];
 
-    if (!e1000_rings_ready || !net_config.nic_present || !dest_ip) return 0;
+    if (!nic_rings_ready() || !net_config.nic_present || !dest_ip) return 0;
 
     if (!net_resolve_mac(dest_ip, dest_mac)) {
         return 0;
@@ -649,7 +774,7 @@ int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port
     if (payload && udp_data_len) memcpy(data, payload, udp_data_len);
 
     if (frame_len < 60) { memset(frame + frame_len, 0, 60 - frame_len); frame_len = 60; }
-    return e1000_send_frame(frame, (uint16_t)frame_len);
+    return nic_send_frame(frame, (uint16_t)frame_len);
 }
 
 /* ---- TCP client (single connection, synchronous/polled) ----
@@ -705,7 +830,7 @@ static uint32_t  tcp_recv_len      = 0;
  * (e.g. re-ACKing) as well as to advance it. */
 static int net_send_tcp_segment(uint8_t flags, const uint8_t *payload, uint16_t payload_len) {
     uint8_t dest_mac[6];
-    if (!e1000_rings_ready || !net_config.nic_present) return 0;
+    if (!nic_rings_ready() || !net_config.nic_present) return 0;
     if (!net_resolve_mac(tcp_conn.remote_ip, dest_mac)) return 0;
 
     uint32_t ip_len32 = (uint32_t)sizeof(ip_header_t) + sizeof(tcp_header_t) + payload_len;
@@ -763,7 +888,7 @@ static int net_send_tcp_segment(uint8_t flags, const uint8_t *payload, uint16_t 
     tcp->chksum = htons(net_checksum16_finish(sum));
 
     if (frame_len < 60) { memset(frame + frame_len, 0, 60 - frame_len); frame_len = 60; }
-    return e1000_send_frame(frame, (uint16_t)frame_len);
+    return nic_send_frame(frame, (uint16_t)frame_len);
 }
 
 void arp_cache_add(const uint8_t ip[4], const uint8_t mac[6]) {
@@ -875,7 +1000,7 @@ static int net_send_arp_request(const uint8_t target_ip[4]) {
     memset(arp->target_mac, 0, 6);
     memcpy(arp->target_ip,  target_ip, 4);
 
-    return e1000_send_frame(frame, (uint16_t)sizeof(frame));
+    return nic_send_frame(frame, (uint16_t)sizeof(frame));
 }
 
 static void net_send_icmp_echo_reply(const eth_header_t *rx_eth, const ip_header_t *rx_ip,
@@ -915,7 +1040,7 @@ static void net_send_icmp_echo_reply(const eth_header_t *rx_eth, const ip_header
     icmp->chksum = htons(net_checksum16(icmp, sizeof(icmp_header_t) + data_len));
 
     if (frame_len < 60) { memset(frame + frame_len, 0, 60 - frame_len); frame_len = 60; }
-    e1000_send_frame(frame, (uint16_t)frame_len);
+    nic_send_frame(frame, (uint16_t)frame_len);
 }
 
 static int net_send_icmp_echo_request(const uint8_t target_mac[6], const uint8_t target_ip[4],
@@ -954,7 +1079,7 @@ static int net_send_icmp_echo_request(const uint8_t target_mac[6], const uint8_t
     icmp->chksum = htons(net_checksum16(icmp, sizeof(icmp_header_t) + data_len));
 
     if (frame_len < 60) { memset(frame + frame_len, 0, 60 - frame_len); frame_len = 60; }
-    return e1000_send_frame(frame, (uint16_t)frame_len);
+    return nic_send_frame(frame, (uint16_t)frame_len);
 }
 
 static void net_handle_icmp(const eth_header_t *eth, const ip_header_t *ip,
@@ -1064,7 +1189,7 @@ static int net_send_arp_reply(const arp_packet_t *request) {
     memcpy(arp->target_mac, request->sender_mac, sizeof(arp->target_mac));
     memcpy(arp->target_ip, request->sender_ip, sizeof(arp->target_ip));
 
-    return e1000_send_frame(frame, sizeof(frame));
+    return nic_send_frame(frame, sizeof(frame));
 }
 
 static void net_handle_arp(arp_packet_t *arp) {
@@ -1179,7 +1304,7 @@ int net_ping(const char *ip_str) {
     uint8_t target_mac[6];
     int found_mac = 0;
 
-    if (!e1000_rings_ready || !net_config.nic_present) return -1;
+    if (!nic_rings_ready() || !net_config.nic_present) return -1;
     if (!ip_str || !parse_ip4(ip_str, target_ip))       return -2;
 
     // Look up target MAC in the ARP cache
@@ -1263,6 +1388,24 @@ static int is_e1000_device(uint16_t vendor_id, uint16_t device_id) {
         case 0x108A:
         case 0x1099:
         case 0x10B5:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* RTL8111/8168/8169 gigabit family only -- deliberately excludes 0x8125/
+ * 0x8126/0x8127 (2.5G+ chips use a different descriptor format and TX/RX
+ * queue model) and 0x8136/0x8161 (Fast Ethernet RTL810x, different register
+ * defaults). Those would need their own driver, not this one. */
+static int is_realtek_device(uint16_t vendor_id, uint16_t device_id) {
+    if (vendor_id != RTL_VENDOR_REALTEK) {
+        return 0;
+    }
+
+    switch (device_id) {
+        case 0x8168: // RTL8111/8168 (most common "Realtek PCIe GbE Family")
+        case 0x8169: // RTL8169, older PCI-generation gigabit, same register map
             return 1;
         default:
             return 0;
@@ -1509,6 +1652,114 @@ static int e1000_init_rings(void) {
     return 1;
 }
 
+static int rtl_send_frame(const uint8_t *frame, uint16_t len) {
+    uint32_t current_tail = rtl_tx_tail;
+    if (!rtl_rings_ready || !frame || len == 0 || len > RTL_TX_BUF_SIZE) {
+        return 0;
+    }
+
+    volatile rtl_desc_t *desc = &rtl_tx_descs[current_tail];
+    if (desc->opts1 & RTL_DESC_OWN) {
+        /* Still owned by the NIC (previous send not yet drained). */
+        return 0;
+    }
+
+    uint8_t *buffer = rtl_tx_buffers + (current_tail * RTL_TX_BUF_SIZE);
+    memcpy(buffer, frame, len);
+    desc->addr  = (uint32_t)buffer;
+    desc->opts2 = 0;
+
+    uint32_t opts1 = RTL_DESC_OWN | RTL_DESC_FIRSTFRAG | RTL_DESC_LASTFRAG |
+                      ((uint32_t)len & RTL_DESC_LEN_MASK);
+    if (current_tail == RTL_TX_DESC_COUNT - 1) {
+        opts1 |= RTL_DESC_RINGEND;
+    }
+    desc->opts1 = opts1;
+
+    rtl_tx_tail = (rtl_tx_tail + 1) % RTL_TX_DESC_COUNT;
+    rtl_write8(RTL_REG_TXPOLL, RTL_TXPOLL_NPQ);
+
+    for (uint32_t timeout = 0; timeout < 100000; timeout++) {
+        if (!(desc->opts1 & RTL_DESC_OWN)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int rtl_init_rings(void) {
+    uint32_t rx_desc_bytes = RTL_RX_DESC_COUNT * sizeof(rtl_desc_t);
+    uint32_t tx_desc_bytes = RTL_TX_DESC_COUNT * sizeof(rtl_desc_t);
+    uint32_t rx_buf_bytes = RTL_RX_DESC_COUNT * RTL_RX_BUF_SIZE;
+    uint32_t tx_buf_bytes = RTL_TX_DESC_COUNT * RTL_TX_BUF_SIZE;
+    uint32_t total_bytes = rx_desc_bytes + tx_desc_bytes + rx_buf_bytes + tx_buf_bytes;
+    uint8_t *region = (uint8_t *)pmm_alloc_region(total_bytes);
+
+    if (!region) {
+        klog("Network: RTL8111/8168 ring allocation failed.");
+        return 0;
+    }
+
+    memset(region, 0, total_bytes);
+    rtl_rx_descs = (rtl_desc_t *)region;
+    region += rx_desc_bytes;
+    rtl_tx_descs = (rtl_desc_t *)region;
+    region += tx_desc_bytes;
+    rtl_rx_buffers = region;
+    region += rx_buf_bytes;
+    rtl_tx_buffers = region;
+
+    for (uint32_t i = 0; i < RTL_RX_DESC_COUNT; i++) {
+        rtl_rx_descs[i].addr = (uint32_t)(rtl_rx_buffers + (i * RTL_RX_BUF_SIZE));
+        uint32_t opts1 = RTL_DESC_OWN | ((uint32_t)RTL_RX_BUF_SIZE & RTL_DESC_LEN_MASK);
+        if (i == RTL_RX_DESC_COUNT - 1) {
+            opts1 |= RTL_DESC_RINGEND;
+        }
+        rtl_rx_descs[i].opts1 = opts1;
+        rtl_rx_descs[i].opts2 = 0;
+    }
+    for (uint32_t i = 0; i < RTL_TX_DESC_COUNT; i++) {
+        rtl_tx_descs[i].addr  = (uint32_t)(rtl_tx_buffers + (i * RTL_TX_BUF_SIZE));
+        rtl_tx_descs[i].opts1 = (i == RTL_TX_DESC_COUNT - 1) ? RTL_DESC_RINGEND : 0;
+        rtl_tx_descs[i].opts2 = 0;
+    }
+
+    rtl_rx_cur = 0;
+    rtl_tx_tail = 0;
+
+    /* Software reset, then wait for the chip to clear the bit itself --
+     * see rtl_io_delay above for why this can't be a timer-based wait. */
+    rtl_write8(RTL_REG_CHIPCMD, RTL_CMD_RESET);
+    for (uint32_t timeout = 0; timeout < 1000; timeout++) {
+        if (!(rtl_read8(RTL_REG_CHIPCMD) & RTL_CMD_RESET)) {
+            break;
+        }
+        rtl_io_delay(1000);
+    }
+
+    rtl_write8(RTL_REG_CFG9346, RTL_CFG9346_UNLOCK);
+
+    rtl_write32(RTL_REG_TXDESC_LOW, (uint32_t)rtl_tx_descs);
+    rtl_write32(RTL_REG_TXDESC_HIGH, 0);
+    rtl_write32(RTL_REG_RXDESC_LOW, (uint32_t)rtl_rx_descs);
+    rtl_write32(RTL_REG_RXDESC_HIGH, 0);
+
+    rtl_write16(RTL_REG_RXMAXSIZE, RTL_RX_BUF_SIZE + 1);
+    rtl_write16(RTL_REG_CPLUSCMD, 0); /* no VLAN/checksum-offload/PktCntrDisable quirks */
+
+    rtl_write32(RTL_REG_TXCONFIG, RTL_TXCFG_DMA_UNLIMITED | RTL_TXCFG_IFG_STANDARD);
+    rtl_write32(RTL_REG_RXCONFIG, RTL_RXCFG_FIFO_UNLIMITED | RTL_RXCFG_DMA_UNLIMITED |
+                                   RTL_RXCFG_ACCEPT_BROADCAST | RTL_RXCFG_ACCEPT_MULTICAST |
+                                   RTL_RXCFG_ACCEPT_MYPHYS);
+
+    rtl_write8(RTL_REG_CHIPCMD, RTL_CMD_RXENB | RTL_CMD_TXENB);
+    rtl_write8(RTL_REG_CFG9346, RTL_CFG9346_LOCK);
+
+    rtl_rings_ready = 1;
+    klog("Network: RTL8111/8168 RX/TX rings initialized.");
+    return 1;
+}
+
 /* net_poll() mutates shared ring state (e1000_rx_cur, the descriptor ring,
  * RDT) and is called both from the dedicated net_poll_task and, re-entrantly,
  * from synchronous helpers running on task 0 (net_send_udp's ARP wait,
@@ -1521,7 +1772,7 @@ static int e1000_init_rings(void) {
 static volatile int net_poll_active = 0;
 
 void net_poll(void) {
-    if (!e1000_rings_ready) {
+    if (!nic_rings_ready()) {
         return;
     }
     if (net_poll_active) {
@@ -1529,6 +1780,7 @@ void net_poll(void) {
     }
     net_poll_active = 1;
 
+    if (e1000_rings_ready) {
     for (uint32_t budget = 0; budget < E1000_RX_DESC_COUNT; budget++) {
         volatile e1000_rx_desc_t *desc = &e1000_rx_descs[e1000_rx_cur];
 
@@ -1564,6 +1816,33 @@ void net_poll(void) {
         e1000_write(E1000_REG_RDT, e1000_rx_cur);
         e1000_rx_cur = (e1000_rx_cur + 1) % E1000_RX_DESC_COUNT;
     }
+    } else if (rtl_rings_ready) {
+        /* RTL has no RDT-style ring-tail register: the NIC just walks its
+         * own ring checking DescOwn on each descriptor, and the driver
+         * hands one back by re-setting DescOwn (rtl8169_mark_to_asic in the
+         * Linux driver) instead of writing a doorbell. */
+        for (uint32_t budget = 0; budget < RTL_RX_DESC_COUNT; budget++) {
+            volatile rtl_desc_t *desc = &rtl_rx_descs[rtl_rx_cur];
+            uint32_t status = desc->opts1;
+
+            if (status & RTL_DESC_OWN) {
+                break; /* still owned by the NIC -- nothing new */
+            }
+
+            if (!(status & RTL_RX_ERROR_BIT)) {
+                uint32_t pkt_len = status & RTL_DESC_LEN_MASK;
+                if (pkt_len > 0 && pkt_len <= RTL_RX_BUF_SIZE) {
+                    net_handle_packet(rtl_rx_buffers + (rtl_rx_cur * RTL_RX_BUF_SIZE), (uint16_t)pkt_len);
+                }
+            }
+
+            uint32_t eor = (rtl_rx_cur == RTL_RX_DESC_COUNT - 1) ? RTL_DESC_RINGEND : 0;
+            desc->opts2 = 0;
+            desc->opts1 = RTL_DESC_OWN | eor | ((uint32_t)RTL_RX_BUF_SIZE & RTL_DESC_LEN_MASK);
+
+            rtl_rx_cur = (rtl_rx_cur + 1) % RTL_RX_DESC_COUNT;
+        }
+    }
 
     net_poll_active = 0;
 }
@@ -1577,8 +1856,7 @@ void net_detect_pci(void) {
             continue;
         }
 
-        if ((dev->class_code == PCI_CLASS_NETWORK && dev->subclass == PCI_SUBCLASS_ETHERNET) ||
-            is_e1000_device(dev->vendor_id, dev->device_id)) {
+        if (is_e1000_device(dev->vendor_id, dev->device_id)) {
             net_config.nic_present = 1;
             net_config.nic_vendor_id = dev->vendor_id;
             net_config.nic_device_id = dev->device_id;
@@ -1590,7 +1868,7 @@ void net_detect_pci(void) {
             net_config.nic_name[3] = '0';
             net_config.nic_name[4] = '0';
             net_config.nic_name[5] = '\0';
-            
+
             // Map 128 KB of e1000 MMIO space (32 pages)
             uint32_t phys = net_config.nic_mmio_base;
             if (phys != 0 && phys != 0xFFFFFFFF) {
@@ -1601,11 +1879,11 @@ void net_detect_pci(void) {
                 for (uint32_t offset = 0; offset < 128 * 1024; offset += 4096) {
                     vmm_map_page_ext(E1000_MMIO_VMEM + offset, phys + offset, 0x1B);
                 }
-                
+
                 // Read the pre-configured MAC address from RAL[0]/RAH[0] registers
                 uint32_t ral = *(volatile uint32_t *)(uintptr_t)(E1000_MMIO_VMEM + 0x5400);
                 uint32_t rah = *(volatile uint32_t *)(uintptr_t)(E1000_MMIO_VMEM + 0x5404);
-                
+
                 // Validate if RAL/RAH are set (not all 0s or all 1s)
                 if (ral != 0 && ral != 0xFFFFFFFF) {
                     net_config.mac[0] = ral & 0xFF;
@@ -1626,12 +1904,73 @@ void net_detect_pci(void) {
                     net_config.mac[4] = w2 & 0xFF;
                     net_config.mac[5] = w2 >> 8;
                 }
-                
+
                 net_config.link_up = 1; // Mark link up
                 klog("Network: Intel e1000 NIC initialized. MAC Address retrieved.");
                 e1000_init_rings();
             }
             return;
+        }
+
+        if (is_realtek_device(dev->vendor_id, dev->device_id)) {
+            /* Registers live in a 256-byte block that can be behind any of
+             * the device's memory-type BARs (unlike e1000, which is always
+             * BAR0) -- mirror rtl_init_one's "first IORESOURCE_MEM BAR"
+             * selection instead of assuming an index. */
+            uint32_t phys = 0;
+            for (int b = 0; b < 6; b++) {
+                uint32_t bar = dev->bar[b];
+                if (bar == 0 || bar == 0xFFFFFFFF) {
+                    continue;
+                }
+                if (!(bar & 0x1)) { // bit0 clear = memory-type BAR
+                    phys = bar & ~0x0F;
+                    break;
+                }
+            }
+
+            if (phys == 0) {
+                klog("Network: Realtek NIC found but no memory BAR -- skipping.");
+                continue;
+            }
+
+            net_config.nic_present = 1;
+            net_config.nic_vendor_id = dev->vendor_id;
+            net_config.nic_device_id = dev->device_id;
+            net_config.nic_mmio_base = phys;
+            net_config.nic_io_base = 0;
+            net_config.nic_name[0] = 'r';
+            net_config.nic_name[1] = 't';
+            net_config.nic_name[2] = 'l';
+            net_config.nic_name[3] = '8';
+            net_config.nic_name[4] = '1';
+            net_config.nic_name[5] = '6';
+            net_config.nic_name[6] = '8';
+            net_config.nic_name[7] = '\0';
+
+            uint32_t command = pci_config_read32(dev->bus, dev->slot, dev->function, 0x04);
+            command |= 0x00000006; // memory space + bus mastering
+            pci_config_write32(dev->bus, dev->slot, dev->function, 0x04, command);
+
+            vmm_map_page_ext(RTL_MMIO_VMEM, phys, 0x1B);
+
+            uint32_t mac_low  = rtl_read32(RTL_REG_MAC0);
+            uint16_t mac_high = rtl_read16(RTL_REG_MAC0 + 4);
+            net_config.mac[0] = mac_low & 0xFF;
+            net_config.mac[1] = (mac_low >> 8) & 0xFF;
+            net_config.mac[2] = (mac_low >> 16) & 0xFF;
+            net_config.mac[3] = (mac_low >> 24) & 0xFF;
+            net_config.mac[4] = mac_high & 0xFF;
+            net_config.mac[5] = (mac_high >> 8) & 0xFF;
+
+            net_config.link_up = 1;
+            klog("Network: Realtek RTL8111/8168 NIC initialized. MAC Address retrieved.");
+            rtl_init_rings();
+            return;
+        }
+
+        if (dev->class_code == PCI_CLASS_NETWORK && dev->subclass == PCI_SUBCLASS_ETHERNET) {
+            klog("Network: Ethernet PCI device found but not a supported NIC (unsupported vendor/device).");
         }
     }
 }
@@ -1655,14 +1994,14 @@ const char *net_status_string(void) {
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n  mmio:     phys=0x");
         append_hex32(net_status_buf, &pos, sizeof(net_status_buf), net_config.nic_mmio_base);
         append_str(net_status_buf, &pos, sizeof(net_status_buf), ", virt=0x");
-        append_hex32(net_status_buf, &pos, sizeof(net_status_buf), E1000_MMIO_VMEM);
+        append_hex32(net_status_buf, &pos, sizeof(net_status_buf), rtl_rings_ready ? RTL_MMIO_VMEM : E1000_MMIO_VMEM);
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n  io:       0x");
         append_hex32(net_status_buf, &pos, sizeof(net_status_buf), net_config.nic_io_base);
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n  mac:      ");
         append_mac(net_status_buf, &pos, sizeof(net_status_buf), net_config.mac);
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n");
-        append_str(net_status_buf, &pos, sizeof(net_status_buf), "  e1000 io: ");
-        append_str(net_status_buf, &pos, sizeof(net_status_buf), e1000_rings_ready ? "rx/tx rings ready\n" : "rings not initialized\n");
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), "  nic io:   ");
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), nic_rings_ready() ? "rx/tx rings ready\n" : "rings not initialized\n");
     } else {
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "none\n");
     }
@@ -1799,7 +2138,7 @@ static void dhcp_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
 int net_config_dhcp(void) {
     extern uint32_t timer_get_ticks(void);
 
-    if (!e1000_rings_ready || !net_config.nic_present) {
+    if (!nic_rings_ready() || !net_config.nic_present) {
         klog("DHCP: no NIC available.");
         return 0;
     }
@@ -1917,7 +2256,7 @@ int net_dns_resolve(const char *hostname, uint8_t out_ip[4]) {
     /* Fast path: hostname is already a dotted-quad IP */
     if (parse_ip4(hostname, out_ip)) return 1;
 
-    if (!net_config.has_config || !e1000_rings_ready) return 0;
+    if (!net_config.has_config || !nic_rings_ready()) return 0;
     if (net_config.dns[0] == 0 && net_config.dns[1] == 0 &&
         net_config.dns[2] == 0 && net_config.dns[3] == 0) return 0;
 
@@ -1978,7 +2317,7 @@ int net_config_dns(const char *dns) {
  * timeout or an RST from the remote. */
 static int net_tcp_connect(const uint8_t dest_ip[4], uint16_t dest_port) {
     extern uint32_t timer_get_ticks(void);
-    if (!e1000_rings_ready || !net_config.nic_present) return -1;
+    if (!nic_rings_ready() || !net_config.nic_present) return -1;
 
     memset(&tcp_conn, 0, sizeof(tcp_conn));
     memcpy(tcp_conn.remote_ip, dest_ip, 4);
@@ -2443,7 +2782,29 @@ int net_save_config(void) {
     return 1;
 }
 
+/* Runs once, the first time net_poll_task executes -- safe here (unlike
+ * directly in kernel_main()) because this only starts running once IRQ0 is
+ * actually driving task_switch(), which requires interrupts already
+ * globally enabled; net_config_dhcp()'s tick-based wait loops would hang
+ * forever if called any earlier (same trap already documented for
+ * UHCI/HTTP in ROADMAP.md). Auto-enables remote access (DHCP + RSH + the
+ * UDP LLM query service) unconditionally so a headless boot -- no working
+ * local video output, e.g. real UEFI-only hardware without a GOP mode
+ * GRUB can use, see ROADMAP.md "Boot UEFI nativo" -- still has SOME way
+ * in, without needing a FAT32 net.cfg on a storage device this kernel's
+ * legacy ATA/UHCI-only drivers likely can't see on modern hardware
+ * either. Both services ship with no auth token by default (same as their
+ * existing "rsh"/"llm net" shell commands did before this) -- intentional
+ * for a bring-up/diagnostic build, not meant as a hardened default. */
+static void net_poll_task_autoconfig(void) {
+    net_config_dhcp();
+    net_rsh_set_enabled(1);
+    net_llm_service_set_enabled(1);
+    klog("Net: DHCP + remote shell (RSH) + LLM UDP service auto-enabled for headless access.");
+}
+
 void net_poll_task(void) {
+    net_poll_task_autoconfig();
     while (1) {
         net_poll();
         task_switch();

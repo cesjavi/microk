@@ -488,9 +488,11 @@ int tensor_softmax(tensor_t *t) {
     return 1;
 }
 
-int tensor_rope(tensor_t *t, uint32_t pos, uint32_t n_head, uint32_t head_dim) {
+int tensor_rope(tensor_t *t, uint32_t pos, uint32_t n_head, uint32_t head_dim, float freq_base) {
     if (!t) return 0;
-    
+
+    fixed_t base_fixed = float_to_fixed(freq_base);
+
     for (uint32_t h = 0; h < n_head; h++) {
         for (uint32_t i = 0; i < head_dim / 2; i++) {
             /* GGUF/GGML weights for llama2.c-style checkpoints (e.g. stories15M)
@@ -502,7 +504,7 @@ int tensor_rope(tensor_t *t, uint32_t pos, uint32_t n_head, uint32_t head_dim) {
              * loaded straight from the GGUF tensors. Using the wrong pairing
              * scrambles attention more and more as position grows, producing
              * a few sane words followed by garbled subword salad. */
-            fixed_t theta = fixed_div(FIXED_ONE, fixed_pow(int_to_fixed(10000), float_to_fixed((float)(2 * i) / (float)head_dim)));
+            fixed_t theta = fixed_div(FIXED_ONE, fixed_pow(base_fixed, float_to_fixed((float)(2 * i) / (float)head_dim)));
             fixed_t f_theta = fixed_mul(theta, int_to_fixed(pos));
             fixed_t cos_val = fixed_cos(f_theta);
             fixed_t sin_val = fixed_sin(f_theta);

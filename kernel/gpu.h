@@ -45,6 +45,13 @@ typedef struct {
     const char *nvidia_family;
     uint32_t mapped_vmem;
     int bar0_mapped;
+
+    /* VRAM size, decoded only for chip families verified against real
+     * Nouveau source (see decode_pascal_vidmem_size in gpu.c) -- 0/unknown
+     * for anything else rather than guessing at a formula we haven't
+     * confirmed for that generation. */
+    uint64_t vram_size_bytes;
+    int vram_size_known;
 } gpu_info_t;
 
 void gpu_init();

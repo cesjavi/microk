@@ -40,6 +40,6 @@ int tensor_add(tensor_t *out, tensor_t *a, tensor_t *b);
 void tensor_apply_activation(tensor_t *t, activation_t act);
 int tensor_rmsnorm(tensor_t *out, tensor_t *in, tensor_t *weight, fixed_t epsilon);
 int tensor_softmax(tensor_t *t);
-int tensor_rope(tensor_t *t, uint32_t pos, uint32_t n_head, uint32_t head_dim);
+int tensor_rope(tensor_t *t, uint32_t pos, uint32_t n_head, uint32_t head_dim, float freq_base);
 
 #endif

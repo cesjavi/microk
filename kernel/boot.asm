@@ -4,12 +4,13 @@
 section .multiboot
 align 4
 ; MICROK_NO_VIDEO_MODE (nasm -D flag): drop the GRAPHICS bit so the
-; bootloader never negotiates a VBE mode itself. Needed for GRUB on
-; VirtualBox/real BIOS, where GRUB's VBE mode-info parsing has a known bug
-; ("unsupported graphical mode type <garbage>") that aborts the multiboot
-; load entirely -- QEMU's own -kernel loader doesn't hit this, so the normal
-; build keeps requesting 800x600x32. Either way kernel/video.c already falls
-; back to VGA text mode when mbi->flags bit 11 (FRAMEBUFFER_INFO) is unset.
+; bootloader never negotiates a video mode itself -- kept as an escape
+; hatch for anything still relying on plain VGA text mode. The
+; "unsupported graphical mode type <garbage>" abort this used to work
+; around was NOT a GRUB bug (see below): the normal build keeps
+; requesting 800x600x32 now that the real cause is fixed. Either way
+; kernel/video.c already falls back to VGA text mode when mbi->flags bit
+; 11 (FRAMEBUFFER_INFO) is unset.
 %ifdef MICROK_NO_VIDEO_MODE
 %define MB_FLAGS 0x00000003
 %else
@@ -18,6 +19,27 @@ align 4
     dd 0x1BADB002               ; Magic number
     dd MB_FLAGS                 ; Flags (ALIGNED + MEMINFO [+ GRAPHICS])
     dd -(0x1BADB002 + MB_FLAGS) ; Checksum
+
+    ; a.out kludge fields (header_addr/load_addr/load_end_addr/bss_end_addr/
+    ; entry_addr) -- unused (MULTIBOOT_AOUT_KLUDGE, bit 16, is never set
+    ; above), but GRUB's struct multiboot_header (grub-core, e.g.
+    ; include/multiboot.h) is a FIXED C struct that always reserves these
+    ; 5 dwords right after the checksum, whether or not the a.out-kludge
+    ; bit is set -- the Multiboot v1 spec only says their VALUES are
+    ; unused, not that the bytes are absent from the layout. Omitting
+    ; them (as this header used to) shifts every field GRUB reads after
+    ; checksum by 20 bytes: grub_multiboot_load() (grub-core/loader/i386/
+    ; multiboot_mbi.c) ends up reading OUR width/height/depth/next-section
+    ; bytes into its mode_type/width/height/depth, so mode_type comes out
+    ; as garbage almost certainly outside its known 0/1 cases -- exactly
+    ; the "unsupported graphical mode type <garbage>" abort this comment
+    ; used to blame on GRUB. Confirmed against GRUB 2.12's actual source
+    ; (the version installed while diagnosing this on real UEFI hardware).
+    dd 0                        ; header_addr (unused)
+    dd 0                        ; load_addr (unused)
+    dd 0                        ; load_end_addr (unused)
+    dd 0                        ; bss_end_addr (unused)
+    dd 0                        ; entry_addr (unused)
 
     ; Graphics fields (mode_type, width, height, depth) - only consulted by
     ; the bootloader when the GRAPHICS bit above is set.

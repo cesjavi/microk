@@ -205,6 +205,29 @@ static const char *decode_nvidia_family(uint32_t pmc_boot) {
     return "Unknown/Unsupported NVIDIA Architecture";
 }
 
+/* NV_PFB_MMU_LOCAL_MEMORY_RANGE (0x100ce0), verified against Nouveau's real
+ * gp102_fb_vidmem_size() (drivers/gpu/drm/nouveau/nvkm/subdev/fb/gp102.c,
+ * upstream Linux), which covers GP102/104/106/107/108 -- GP107 is the GTX
+ * 1050's chip (device 0x1C81/0x1C82/etc., PMC_BOOT_0 top byte 0x13,
+ * "Pascal" bucket in decode_nvidia_family() above). GP100 (Tesla P100, a
+ * different consumer-absent die) uses a more involved multi-register
+ * floorsweeping-aware formula in real Nouveau (gm200_ram_probe_fbp_amount)
+ * that this does NOT implement -- deliberately not guessed at, since
+ * getting it wrong would silently misreport VRAM size on that one chip.
+ * Read-only: this never writes to the GPU. */
+static uint64_t decode_pascal_vidmem_size(uint32_t bar0_vmem) {
+    volatile uint32_t *reg = (volatile uint32_t *)(uintptr_t)(bar0_vmem + 0x100ce0);
+    uint32_t data = *reg;
+    uint32_t lmag = (data & 0x000003f0) >> 4;
+    uint32_t lsca = (data & 0x0000000f);
+    uint64_t size = (uint64_t)lmag << (lsca + 20);
+
+    if (data & 0x40000000) {
+        return size / 16 * 15;
+    }
+    return size;
+}
+
 void gpu_init() {
     active_gpu.present = 0;
     active_gpu.vendor = GPU_VENDOR_NONE;
@@ -276,6 +299,16 @@ void gpu_init() {
                 
                 // Decode architecture family
                 active_gpu.nvidia_family = decode_nvidia_family(active_gpu.pmc_boot_0);
+
+                // VRAM size: only for the one family/formula verified against
+                // real Nouveau source (see decode_pascal_vidmem_size above).
+                active_gpu.vram_size_bytes = 0;
+                active_gpu.vram_size_known = 0;
+                if (((active_gpu.pmc_boot_0 >> 24) & 0xFF) == 0x13) {
+                    active_gpu.vram_size_bytes = decode_pascal_vidmem_size(NVIDIA_BAR0_VMEM);
+                    active_gpu.vram_size_known = 1;
+                    klog("GPU: NVIDIA VRAM size decoded (Pascal GP102/104/106/107/108 formula).");
+                }
             }
         } else if (vendor == GPU_VENDOR_AMD) {
             klog("GPU: AMD display device detected.");
@@ -350,6 +383,13 @@ const char *gpu_status_string() {
             append_str(&cursor, end, "\n    Decoded Architecture:      ");
             append_str(&cursor, end, active_gpu.nvidia_family ? active_gpu.nvidia_family : "unknown");
             append_char(&cursor, end, '\n');
+            append_str(&cursor, end, "    VRAM size:                 ");
+            if (active_gpu.vram_size_known) {
+                append_uint(&cursor, end, (uint32_t)(active_gpu.vram_size_bytes / (1024 * 1024)));
+                append_str(&cursor, end, " MiB\n");
+            } else {
+                append_str(&cursor, end, "unknown (formula not verified for this chip family)\n");
+            }
         } else {
             append_str(&cursor, end, "Not Mapped\n");
         }

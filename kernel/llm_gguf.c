@@ -317,6 +317,12 @@ int gguf_probe(uint32_t start, uint32_t size, gguf_info_t *info) {
 
         gguf_get_metadata_value_from_info(start, size, &computed, "llama.attention.layer_norm_rms_epsilon", GGUF_METADATA_FLOAT32, &computed.arch.rms_norm_eps);
 
+        /* Default matches every Llama checkpoint seen so far (stories15M,
+         * TinyLlama) so this is a no-op for them; only overridden for models
+         * that actually set a different llama.rope.freq_base. */
+        computed.arch.rope_freq_base = 10000.0f;
+        gguf_get_metadata_value_from_info(start, size, &computed, "llama.rope.freq_base", GGUF_METADATA_FLOAT32, &computed.arch.rope_freq_base);
+
         gguf_probe_cache = computed;
         gguf_probe_cache_start = start;
         gguf_probe_cache_size = size;
