@@ -30,6 +30,9 @@ void net_init(void);
 void net_detect_pci(void);
 void net_handle_packet(uint8_t *data, uint32_t len);
 void net_poll(void);
+int net_wifi_scan(void);
+int net_wifi_associate(uint8_t network_index);
+int net_wifi_connect_wpa2(uint8_t network_index, const char *passphrase);
 const net_config_t *net_get_config(void);
 const char *net_status_string(void);
 int net_config_dhcp(void);
@@ -51,12 +54,37 @@ void arp_cache_add(const uint8_t ip[4], const uint8_t mac[6]);
 /* ICMP ping: returns RTT in ms on success, 0 on timeout, <0 on error */
 int net_ping(const char *ip_str);
 
-/* UDP: send a datagram; dest_ip=255.255.255.255 uses broadcast MAC */
+/* UDP: send a datagram; dest_ip=255.255.255.255 uses broadcast MAC. Resolves
+ * dest_mac via the ARP cache (blocking on a fresh ARP request/reply if not
+ * yet cached) -- callers replying to a peer whose MAC is already known (e.g.
+ * from the frame that triggered the reply) should prefer
+ * net_send_udp_to_mac() instead, both to skip the round trip and because
+ * that resolution can't make progress at all when called from inside the
+ * RX dispatch path (see net_send_udp_to_mac's doc comment). */
 int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port,
                  const uint8_t *payload, uint16_t payload_len);
 
-/* UDP port binding: register/unregister a receive handler */
-typedef void (*net_udp_handler_t)(const uint8_t src_ip[4], uint16_t src_port,
+/* UDP: send a datagram straight to a known dest_mac, no ARP cache lookup.
+ * Mirrors how ICMP echo replies already reply using the request frame's
+ * source MAC directly (see net_send_icmp_echo_reply in net.c) instead of
+ * going through the ARP cache -- UDP port handlers invoked from
+ * net_handle_packet() (itself called from inside net_poll()'s RX loop)
+ * should use this with the src_mac their handler was given, rather than
+ * net_send_udp(): net_send_udp()'s ARP-miss path waits by calling
+ * net_poll() in a loop, which is a guaranteed no-op while already nested
+ * inside net_poll() (net_poll_active is 1 the whole time), so any reply
+ * needing a fresh ARP resolution from that context can never actually
+ * complete. */
+int net_send_udp_to_mac(const uint8_t dest_ip[4], const uint8_t dest_mac[6],
+                        uint16_t dest_port, uint16_t src_port,
+                        const uint8_t *payload, uint16_t payload_len);
+
+/* UDP port binding: register/unregister a receive handler. src_mac is the
+ * Ethernet source address of the frame that carried this datagram -- pass
+ * it straight to net_send_udp_to_mac() when replying (see its doc comment
+ * for why net_send_udp() can silently fail to reply from this context). */
+typedef void (*net_udp_handler_t)(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                                   uint16_t src_port,
                                    const uint8_t *payload, uint16_t len);
 int  net_udp_bind(uint16_t port, net_udp_handler_t handler);
 void net_udp_unbind(uint16_t port);

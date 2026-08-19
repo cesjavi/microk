@@ -6,6 +6,7 @@
 #include "vmm.h"
 #include "string.h"
 #include "io.h"
+#include "iwlwifi.h"
 
 #define E1000_MMIO_VMEM 0xFE000000
 
@@ -39,6 +40,7 @@
 #define E1000_TCTL_EN    (1u << 1)
 #define E1000_TCTL_PSP   (1u << 3)
 #define E1000_CTRL_SLU   (1u << 6)
+#define E1000_STATUS_LU  (1u << 1)
 
 #define E1000_TX_CMD_EOP  0x01
 #define E1000_TX_CMD_IFCS 0x02
@@ -74,13 +76,20 @@
 #define RTL_REG_TXDESC_HIGH 0x24
 #define RTL_REG_CHIPCMD     0x37
 #define RTL_REG_TXPOLL      0x38
+#define RTL_REG_INTRMASK    0x3C
+#define RTL_REG_INTRSTATUS  0x3E
 #define RTL_REG_TXCONFIG    0x40
 #define RTL_REG_RXCONFIG    0x44
 #define RTL_REG_CFG9346     0x50
+#define RTL_REG_PHYSTATUS   0x6C
+#define RTL_REG_DLLPR       0xD0
 #define RTL_REG_RXMAXSIZE   0xDA
 #define RTL_REG_CPLUSCMD    0xE0
+#define RTL_REG_INTRMITIGATE 0xE2
 #define RTL_REG_RXDESC_LOW  0xE4
 #define RTL_REG_RXDESC_HIGH 0xE8
+#define RTL_REG_MAXTXSIZE   0xEC
+#define RTL_REG_MISC1       0xF2
 
 #define RTL_CMD_RESET  0x10
 #define RTL_CMD_RXENB  0x08
@@ -88,12 +97,25 @@
 
 #define RTL_CFG9346_UNLOCK 0xC0
 #define RTL_CFG9346_LOCK   0x00
+#define RTL_PHYSTATUS_LINK (1u << 1)
+#define RTL_CPLUS_RXVLAN    (1u << 6)
+#define RTL_CPLUS_RXCHKSUM  (1u << 5)
+#define RTL_CPLUS_PCIDAC    (1u << 4)
+#define RTL_MAX_TX_PACKET   (8064u >> 7)
+#define RTL_EARLY_TX_SIZE   0x27u
+#define RTL_XID_8168H       0x541u
+#define RTL_DLLPR_PFM_EN     (1u << 6)
+#define RTL_DLLPR_TX10M_PS   (1u << 7)
+#define RTL_MISC1_D3COLD_EN  (1u << 6)
 
 #define RTL_TXPOLL_NPQ 0x40 /* kick the (only) TX queue we use */
 
 #define RTL_RXCFG_ACCEPT_BROADCAST (1u << 3)
 #define RTL_RXCFG_ACCEPT_MULTICAST (1u << 2)
 #define RTL_RXCFG_ACCEPT_MYPHYS    (1u << 1)
+#define RTL_RXCFG_RX128_INT_EN     (1u << 15)
+#define RTL_RXCFG_MULTI_EN         (1u << 14)
+#define RTL_RXCFG_EARLY_OFF        (1u << 11)
 #define RTL_RXCFG_FIFO_UNLIMITED   (7u << 13)
 #define RTL_RXCFG_DMA_UNLIMITED    (7u << 8)
 
@@ -107,6 +129,8 @@
 #define RTL_DESC_LEN_MASK  0x3FFFu    /* low 14 bits: buffer/packet length */
 
 #define RTL_RX_ERROR_BIT (1u << 21)   /* RxRES */
+#define RTL_ETH_FCS_LEN 4u
+#define RTL_ETH_MIN_FRAME 60u
 
 #define RTL_RX_DESC_COUNT 16
 #define RTL_TX_DESC_COUNT 8
@@ -114,7 +138,7 @@
 #define RTL_TX_BUF_SIZE 2048
 
 static net_config_t net_config;
-static char net_status_buf[256];
+static char net_status_buf[1024];
 static char net_llm_status_buf[160];
 static int net_llm_service_on = 0;
 static uint16_t net_llm_service_port = 1234;
@@ -182,6 +206,15 @@ static rtl_desc_t *rtl_rx_descs;
 static rtl_desc_t *rtl_tx_descs;
 static uint8_t *rtl_rx_buffers;
 static uint8_t *rtl_tx_buffers;
+static uint32_t rtl_rx_packets;
+static uint32_t rtl_rx_errors;
+static uint32_t rtl_tx_packets;
+static uint32_t rtl_tx_busy;
+static uint16_t rtl_xid;
+static int rtl_is_8168h;
+static int wifi_route_active;
+static uint8_t wired_mac_address[6];
+static int wired_mac_valid;
 
 static inline int nic_rings_ready(void) {
     return e1000_rings_ready || rtl_rings_ready;
@@ -405,18 +438,23 @@ static int rtl_send_frame(const uint8_t *frame, uint16_t len);
  * At most one of e1000_rings_ready/rtl_rings_ready is ever set, since
  * net_detect_pci() stops at the first supported device it finds. */
 static int nic_send_frame(const uint8_t *frame, uint16_t len) {
+    if (wifi_route_active) return iwlwifi_send_ethernet(frame, len);
     if (rtl_rings_ready) {
         return rtl_send_frame(frame, len);
     }
     return e1000_send_frame(frame, len);
 }
-static void net_llm_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void net_llm_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                                 uint16_t src_port,
                                  const uint8_t *payload, uint16_t len);
-static void dhcp_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void dhcp_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                              uint16_t src_port,
                               const uint8_t *payload, uint16_t len);
-static void dns_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void dns_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                             uint16_t src_port,
                              const uint8_t *payload, uint16_t len);
-static void net_rsh_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void net_rsh_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                                 uint16_t src_port,
                                  const uint8_t *payload, uint16_t len);
 
 static int text_equals(const char *text, uint32_t len, const char *expected) {
@@ -516,7 +554,8 @@ static uint32_t trim_packet_text(char *text, uint32_t len) {
     return len;
 }
 
-static void net_llm_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void net_llm_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                                 uint16_t src_port,
                                  const uint8_t *payload, uint16_t len) {
     char request_buf[128];
     char response[256];
@@ -534,7 +573,8 @@ static void net_llm_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
     klog(response);
 
     uint16_t resp_len = (uint16_t)strlen(response);
-    if (net_send_udp(src_ip, src_port, net_llm_service_port, (const uint8_t *)response, resp_len)) {
+    if (net_send_udp_to_mac(src_ip, src_mac, src_port, net_llm_service_port,
+                            (const uint8_t *)response, resp_len)) {
         klog("Network LLM UDP response sent.");
     } else {
         klog("Network LLM UDP response send failed.");
@@ -717,18 +757,12 @@ static int net_resolve_mac(const uint8_t dest_ip[4], uint8_t out_mac[6]) {
     return 0;
 }
 
-/* net_send_udp: send a UDP datagram to dest_ip:dest_port from src_port.
- * Handles ARP resolution automatically; dest_ip=255.255.255.255 uses broadcast MAC. */
-int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port,
-                 const uint8_t *payload, uint16_t payload_len) {
-    uint8_t dest_mac[6];
-
-    if (!nic_rings_ready() || !net_config.nic_present || !dest_ip) return 0;
-
-    if (!net_resolve_mac(dest_ip, dest_mac)) {
-        return 0;
-    }
-
+/* Shared frame-build-and-send for net_send_udp/net_send_udp_to_mac, once
+ * dest_mac is already known -- see the doc comments on those two in net.h
+ * for why callers need to pick the right one. */
+static int net_build_and_send_udp(const uint8_t dest_ip[4], const uint8_t dest_mac[6],
+                                  uint16_t dest_port, uint16_t src_port,
+                                  const uint8_t *payload, uint16_t payload_len) {
     uint16_t udp_data_len = payload_len;
     /* Do the length math in 32 bits and bounds-check *before* truncating to
      * the on-wire uint16_t ip_len field. udp_data_len can be up to 65535,
@@ -775,6 +809,26 @@ int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port
 
     if (frame_len < 60) { memset(frame + frame_len, 0, 60 - frame_len); frame_len = 60; }
     return nic_send_frame(frame, (uint16_t)frame_len);
+}
+
+int net_send_udp(const uint8_t dest_ip[4], uint16_t dest_port, uint16_t src_port,
+                 const uint8_t *payload, uint16_t payload_len) {
+    uint8_t dest_mac[6];
+
+    if (!nic_rings_ready() || !net_config.nic_present || !dest_ip) return 0;
+    if (!net_resolve_mac(dest_ip, dest_mac)) return 0;
+
+    return net_build_and_send_udp(dest_ip, dest_mac, dest_port, src_port,
+                                  payload, payload_len);
+}
+
+int net_send_udp_to_mac(const uint8_t dest_ip[4], const uint8_t dest_mac[6],
+                        uint16_t dest_port, uint16_t src_port,
+                        const uint8_t *payload, uint16_t payload_len) {
+    if (!nic_rings_ready() || !net_config.nic_present || !dest_ip || !dest_mac) return 0;
+
+    return net_build_and_send_udp(dest_ip, dest_mac, dest_port, src_port,
+                                  payload, payload_len);
 }
 
 /* ---- TCP client (single connection, synchronous/polled) ----
@@ -1232,6 +1286,22 @@ void net_handle_packet(uint8_t *data, uint32_t len) {
     if (len < sizeof(eth_header_t) + sizeof(ip_header_t)) return;
     ip_header_t *ip = (ip_header_t *)(data + sizeof(eth_header_t));
 
+    /* Opportunistically learn (src IP -> src MAC) from any IP traffic, not
+     * just ARP packets. Without this, a UDP responder (net_llm_udp_handler,
+     * net_rsh_udp_handler) that needs to reply to a peer MicroK has not
+     * ARP'd itself falls into net_resolve_mac()'s ARP-request-and-wait path
+     * -- which calls net_poll() in a loop to pump for the reply, but since
+     * these handlers are themselves invoked from inside net_poll()'s own RX
+     * dispatch (net_poll_active already 1), that nested net_poll() is a
+     * guaranteed no-op and the wait always times out. ICMP echo replies
+     * never hit this because they reply using the request frame's src MAC
+     * directly, never touching the ARP cache -- which is why ping worked
+     * over RTL8111H real hardware while the UDP services silently never
+     * responded to the exact same peer. Learning from data traffic (not
+     * just ARP) is also just standard IP stack behavior, matching how real
+     * OSes populate their neighbor tables. */
+    arp_cache_add(ip->src, eth->src);
+
     uint32_t ip_header_len = (ip->version_ihl & 0x0F) * 4;
     if (ip_header_len < sizeof(ip_header_t)) return;
     /* ip_header_len (IHL) is attacker-controlled and can be up to 60 bytes,
@@ -1290,7 +1360,7 @@ void net_handle_packet(uint8_t *data, uint32_t len) {
 
     for (int i = 0; i < UDP_BINDINGS_MAX; i++) {
         if (udp_bindings[i].active && udp_bindings[i].port == dport) {
-            udp_bindings[i].handler(ip->src, sport, udp_payload, payload_len);
+            udp_bindings[i].handler(ip->src, eth->src, sport, udp_payload, payload_len);
             break;
         }
     }
@@ -1425,6 +1495,15 @@ static void append_u8(char *out, uint32_t *pos, uint32_t max, uint8_t value) {
     char tmp[4];
     itoa(value, tmp, 10);
     append_str(out, pos, max, tmp);
+}
+
+static void append_i8(char *out, uint32_t *pos, uint32_t max, int8_t value) {
+    if (value < 0) {
+        append_str(out, pos, max, "-");
+        append_u8(out, pos, max, (uint8_t)(-(int16_t)value));
+    } else {
+        append_u8(out, pos, max, (uint8_t)value);
+    }
 }
 
 static void append_ip(char *out, uint32_t *pos, uint32_t max, const uint8_t ip[4]) {
@@ -1661,30 +1740,37 @@ static int rtl_send_frame(const uint8_t *frame, uint16_t len) {
     volatile rtl_desc_t *desc = &rtl_tx_descs[current_tail];
     if (desc->opts1 & RTL_DESC_OWN) {
         /* Still owned by the NIC (previous send not yet drained). */
+        rtl_tx_busy++;
         return 0;
     }
 
     uint8_t *buffer = rtl_tx_buffers + (current_tail * RTL_TX_BUF_SIZE);
     memcpy(buffer, frame, len);
+    uint16_t wire_len = len < RTL_ETH_MIN_FRAME ? RTL_ETH_MIN_FRAME : len;
+    if (wire_len > len) {
+        memset(buffer + len, 0, wire_len - len);
+    }
     desc->addr  = (uint32_t)buffer;
     desc->opts2 = 0;
 
     uint32_t opts1 = RTL_DESC_OWN | RTL_DESC_FIRSTFRAG | RTL_DESC_LASTFRAG |
-                      ((uint32_t)len & RTL_DESC_LEN_MASK);
+                      ((uint32_t)wire_len & RTL_DESC_LEN_MASK);
     if (current_tail == RTL_TX_DESC_COUNT - 1) {
         opts1 |= RTL_DESC_RINGEND;
     }
+    /* Buffer and descriptor contents must be globally visible before OWN
+     * transfers the descriptor to the device. */
+    __asm__ volatile ("" ::: "memory");
     desc->opts1 = opts1;
 
     rtl_tx_tail = (rtl_tx_tail + 1) % RTL_TX_DESC_COUNT;
     rtl_write8(RTL_REG_TXPOLL, RTL_TXPOLL_NPQ);
-
-    for (uint32_t timeout = 0; timeout < 100000; timeout++) {
-        if (!(desc->opts1 & RTL_DESC_OWN)) {
-            return 1;
-        }
-    }
-    return 0;
+    /* Submission succeeded once ownership and the queue kick reached the
+     * device. Completion is asynchronous; the next use of this slot checks
+     * OWN again, so a short CPU-speed-dependent busy loop here only produced
+     * false send failures on slower links. */
+    rtl_tx_packets++;
+    return 1;
 }
 
 static int rtl_init_rings(void) {
@@ -1726,18 +1812,45 @@ static int rtl_init_rings(void) {
 
     rtl_rx_cur = 0;
     rtl_tx_tail = 0;
+    rtl_rx_packets = 0;
+    rtl_rx_errors = 0;
+    rtl_tx_packets = 0;
+    rtl_tx_busy = 0;
 
     /* Software reset, then wait for the chip to clear the bit itself --
      * see rtl_io_delay above for why this can't be a timer-based wait. */
+    rtl_rings_ready = 0;
     rtl_write8(RTL_REG_CHIPCMD, RTL_CMD_RESET);
+    int reset_complete = 0;
     for (uint32_t timeout = 0; timeout < 1000; timeout++) {
         if (!(rtl_read8(RTL_REG_CHIPCMD) & RTL_CMD_RESET)) {
+            reset_complete = 1;
             break;
         }
         rtl_io_delay(1000);
     }
+    if (!reset_complete) {
+        klog("Network: RTL8111/8168 reset timed out; initialization aborted.");
+        return 0;
+    }
 
     rtl_write8(RTL_REG_CFG9346, RTL_CFG9346_UNLOCK);
+
+    if (rtl_is_8168h) {
+        /* RTL8168H-specific power-state cleanup from rtl_hw_start_8168h_1.
+         * These bits can remain set after firmware/another OS and gate DMA. */
+        rtl_write8(RTL_REG_DLLPR,
+                   rtl_read8(RTL_REG_DLLPR) &
+                   (uint8_t)~(RTL_DLLPR_PFM_EN | RTL_DLLPR_TX10M_PS));
+        rtl_write8(RTL_REG_MISC1,
+                   rtl_read8(RTL_REG_MISC1) &
+                   (uint8_t)~RTL_MISC1_D3COLD_EN);
+    }
+
+    /* This driver polls descriptors, so leave device interrupts masked and
+     * acknowledge any status left by firmware/the previous operating system. */
+    rtl_write16(RTL_REG_INTRMASK, 0);
+    rtl_write16(RTL_REG_INTRSTATUS, 0xFFFFu);
 
     rtl_write32(RTL_REG_TXDESC_LOW, (uint32_t)rtl_tx_descs);
     rtl_write32(RTL_REG_TXDESC_HIGH, 0);
@@ -1745,12 +1858,29 @@ static int rtl_init_rings(void) {
     rtl_write32(RTL_REG_RXDESC_HIGH, 0);
 
     rtl_write16(RTL_REG_RXMAXSIZE, RTL_RX_BUF_SIZE + 1);
-    rtl_write16(RTL_REG_CPLUSCMD, 0); /* no VLAN/checksum-offload/PktCntrDisable quirks */
+    rtl_write8(RTL_REG_MAXTXSIZE,
+               rtl_is_8168h ? RTL_EARLY_TX_SIZE : RTL_MAX_TX_PACKET);
+    /* Keep silicon/firmware-owned CPlusCmd bits. Disable only features this
+     * minimal driver does not consume, plus 64-bit DMA because MicroK is a
+     * 32-bit identity-mapped kernel. */
+    uint16_t cplus = rtl_read16(RTL_REG_CPLUSCMD);
+    cplus &= (uint16_t)~(RTL_CPLUS_RXVLAN | RTL_CPLUS_RXCHKSUM | RTL_CPLUS_PCIDAC);
+    rtl_write16(RTL_REG_CPLUSCMD, cplus);
 
     rtl_write32(RTL_REG_TXCONFIG, RTL_TXCFG_DMA_UNLIMITED | RTL_TXCFG_IFG_STANDARD);
-    rtl_write32(RTL_REG_RXCONFIG, RTL_RXCFG_FIFO_UNLIMITED | RTL_RXCFG_DMA_UNLIMITED |
-                                   RTL_RXCFG_ACCEPT_BROADCAST | RTL_RXCFG_ACCEPT_MULTICAST |
-                                   RTL_RXCFG_ACCEPT_MYPHYS);
+    uint32_t rxcfg = RTL_RXCFG_DMA_UNLIMITED |
+                     RTL_RXCFG_ACCEPT_BROADCAST | RTL_RXCFG_ACCEPT_MULTICAST |
+                     RTL_RXCFG_ACCEPT_MYPHYS;
+    if (rtl_is_8168h) {
+        /* Linux r8169 uses this combination for MAC versions 40..52,
+         * including RTL8168H/8111H (XID 0x541). */
+        rxcfg |= RTL_RXCFG_RX128_INT_EN | RTL_RXCFG_MULTI_EN |
+                 RTL_RXCFG_EARLY_OFF;
+    } else {
+        rxcfg |= RTL_RXCFG_FIFO_UNLIMITED;
+    }
+    rtl_write32(RTL_REG_RXCONFIG, rxcfg);
+    rtl_write16(RTL_REG_INTRMITIGATE, 0);
 
     rtl_write8(RTL_REG_CHIPCMD, RTL_CMD_RXENB | RTL_CMD_TXENB);
     rtl_write8(RTL_REG_CFG9346, RTL_CFG9346_LOCK);
@@ -1772,13 +1902,31 @@ static int rtl_init_rings(void) {
 static volatile int net_poll_active = 0;
 
 void net_poll(void) {
-    if (!nic_rings_ready()) {
-        return;
-    }
     if (net_poll_active) {
         return;
     }
     net_poll_active = 1;
+    iwlwifi_poll();
+    if (wifi_route_active) {
+        net_config.link_up = iwlwifi_get_state()->link_associated &&
+                             iwlwifi_get_state()->link_security_ready;
+        if (!net_config.link_up) {
+            int wired_up = rtl_rings_ready ?
+                ((rtl_read8(RTL_REG_PHYSTATUS) & RTL_PHYSTATUS_LINK) != 0) :
+                (e1000_rings_ready &&
+                 ((e1000_read(E1000_REG_STATUS) & E1000_STATUS_LU) != 0));
+            if (wired_up && wired_mac_valid) {
+                wifi_route_active = 0;
+                memcpy(net_config.mac, wired_mac_address, 6);
+                memset(arp_cache, 0, sizeof(arp_cache));
+                net_config.link_up = 1;
+            }
+        }
+    }
+    if (!nic_rings_ready()) {
+        net_poll_active = 0;
+        return;
+    }
 
     if (e1000_rings_ready) {
     for (uint32_t budget = 0; budget < E1000_RX_DESC_COUNT; budget++) {
@@ -1788,7 +1936,8 @@ void net_poll(void) {
             break;
         }
 
-        if (desc->length > 0 && desc->length <= E1000_RX_BUF_SIZE) {
+        if (!wifi_route_active && desc->length > 0 &&
+            desc->length <= E1000_RX_BUF_SIZE) {
             net_handle_packet(e1000_rx_buffers + (e1000_rx_cur * E1000_RX_BUF_SIZE), desc->length);
         }
 
@@ -1817,6 +1966,9 @@ void net_poll(void) {
         e1000_rx_cur = (e1000_rx_cur + 1) % E1000_RX_DESC_COUNT;
     }
     } else if (rtl_rings_ready) {
+        if (!wifi_route_active)
+            net_config.link_up =
+                (rtl_read8(RTL_REG_PHYSTATUS) & RTL_PHYSTATUS_LINK) != 0;
         /* RTL has no RDT-style ring-tail register: the NIC just walks its
          * own ring checking DescOwn on each descriptor, and the driver
          * hands one back by re-setting DescOwn (rtl8169_mark_to_asic in the
@@ -1829,15 +1981,29 @@ void net_poll(void) {
                 break; /* still owned by the NIC -- nothing new */
             }
 
-            if (!(status & RTL_RX_ERROR_BIT)) {
+            if (!(status & RTL_RX_ERROR_BIT) &&
+                (status & (RTL_DESC_FIRSTFRAG | RTL_DESC_LASTFRAG)) ==
+                (RTL_DESC_FIRSTFRAG | RTL_DESC_LASTFRAG)) {
                 uint32_t pkt_len = status & RTL_DESC_LEN_MASK;
-                if (pkt_len > 0 && pkt_len <= RTL_RX_BUF_SIZE) {
-                    net_handle_packet(rtl_rx_buffers + (rtl_rx_cur * RTL_RX_BUF_SIZE), (uint16_t)pkt_len);
+                /* RTL8168 reports the trailing Ethernet FCS in the RX
+                 * descriptor length; the network stack expects it removed. */
+                if (pkt_len >= RTL_ETH_FCS_LEN) {
+                    pkt_len -= RTL_ETH_FCS_LEN;
                 }
+                if (!wifi_route_active && pkt_len > 0 &&
+                    pkt_len <= RTL_RX_BUF_SIZE - RTL_ETH_FCS_LEN) {
+                    rtl_rx_packets++;
+                    net_handle_packet(rtl_rx_buffers + (rtl_rx_cur * RTL_RX_BUF_SIZE), (uint16_t)pkt_len);
+                } else if (!wifi_route_active) {
+                    rtl_rx_errors++;
+                }
+            } else {
+                rtl_rx_errors++;
             }
 
             uint32_t eor = (rtl_rx_cur == RTL_RX_DESC_COUNT - 1) ? RTL_DESC_RINGEND : 0;
             desc->opts2 = 0;
+            __asm__ volatile ("" ::: "memory");
             desc->opts1 = RTL_DESC_OWN | eor | ((uint32_t)RTL_RX_BUF_SIZE & RTL_DESC_LEN_MASK);
 
             rtl_rx_cur = (rtl_rx_cur + 1) % RTL_RX_DESC_COUNT;
@@ -1847,8 +2013,35 @@ void net_poll(void) {
     net_poll_active = 0;
 }
 
+int net_wifi_scan(void) {
+    return iwlwifi_start_scan();
+}
+
+int net_wifi_associate(uint8_t network_index) {
+    if (!iwlwifi_associate_open(network_index)) return 0;
+    const iwlwifi_state_t *wifi = iwlwifi_get_state();
+    if (!wifi->link_security_ready) return 0;
+    memcpy(net_config.mac, wifi->mac_address, sizeof(net_config.mac));
+    memset(arp_cache, 0, sizeof(arp_cache));
+    net_config.link_up = 1;
+    wifi_route_active = 1;
+    return 1;
+}
+
+int net_wifi_connect_wpa2(uint8_t network_index, const char *passphrase) {
+    if (!iwlwifi_connect_wpa2(network_index, passphrase)) return 0;
+    const iwlwifi_state_t *wifi = iwlwifi_get_state();
+    memcpy(net_config.mac, wifi->mac_address, sizeof(net_config.mac));
+    memset(arp_cache, 0, sizeof(arp_cache));
+    net_config.link_up = 1;
+    wifi_route_active = 1;
+    return 1;
+}
+
 void net_detect_pci(void) {
     int count = pci_device_count();
+
+    iwlwifi_probe();
 
     for (int i = 0; i < count; i++) {
         pci_device_t *dev = pci_get_device(i);
@@ -1905,6 +2098,9 @@ void net_detect_pci(void) {
                     net_config.mac[5] = w2 >> 8;
                 }
 
+                memcpy(wired_mac_address, net_config.mac, 6);
+                wired_mac_valid = 1;
+
                 net_config.link_up = 1; // Mark link up
                 klog("Network: Intel e1000 NIC initialized. MAC Address retrieved.");
                 e1000_init_rings();
@@ -1924,7 +2120,18 @@ void net_detect_pci(void) {
                     continue;
                 }
                 if (!(bar & 0x1)) { // bit0 clear = memory-type BAR
-                    phys = bar & ~0x0F;
+                    uint32_t type = (bar >> 1) & 0x3u;
+                    if (type == 0x2u) { /* 64-bit memory BAR */
+                        if (b == 5 || dev->bar[b + 1] != 0) {
+                            /* The 32-bit VMM cannot map MMIO at/above 4 GiB.
+                             * Do not mistake the high dword for another BAR. */
+                            b++;
+                            continue;
+                        }
+                    } else if (type != 0) {
+                        continue; /* reserved PCI memory BAR encoding */
+                    }
+                    phys = bar & ~0x0Fu;
                     break;
                 }
             }
@@ -1951,8 +2158,27 @@ void net_detect_pci(void) {
             uint32_t command = pci_config_read32(dev->bus, dev->slot, dev->function, 0x04);
             command |= 0x00000006; // memory space + bus mastering
             pci_config_write32(dev->bus, dev->slot, dev->function, 0x04, command);
+            command = pci_config_read32(dev->bus, dev->slot, dev->function, 0x04);
+            if ((command & 0x00000006u) != 0x00000006u) {
+                net_config.nic_present = 0;
+                klog("Network: Realtek PCI memory/bus-master enable failed.");
+                return;
+            }
 
             vmm_map_page_ext(RTL_MMIO_VMEM, phys, 0x1B);
+
+            uint32_t rtl_txconfig_id = rtl_read32(RTL_REG_TXCONFIG);
+            if (rtl_txconfig_id == 0xFFFFFFFFu) {
+                net_config.nic_present = 0;
+                klog("Network: Realtek MMIO read failed.");
+                return;
+            }
+            rtl_xid = (uint16_t)((rtl_txconfig_id >> 20) & 0x0FCFu);
+            rtl_is_8168h = ((rtl_xid & 0x07CFu) == RTL_XID_8168H);
+            if (dev->device_id == 0x8168 && dev->revision == 0x15 &&
+                !rtl_is_8168h) {
+                klog("Network: RTL8168 REV 15 has an unexpected MAC XID; using generic setup.");
+            }
 
             uint32_t mac_low  = rtl_read32(RTL_REG_MAC0);
             uint16_t mac_high = rtl_read16(RTL_REG_MAC0 + 4);
@@ -1962,10 +2188,27 @@ void net_detect_pci(void) {
             net_config.mac[3] = (mac_low >> 24) & 0xFF;
             net_config.mac[4] = mac_high & 0xFF;
             net_config.mac[5] = (mac_high >> 8) & 0xFF;
+            int mac_all_zero = 1;
+            int mac_all_ff = 1;
+            for (int m = 0; m < 6; m++) {
+                if (net_config.mac[m] != 0x00) mac_all_zero = 0;
+                if (net_config.mac[m] != 0xFF) mac_all_ff = 0;
+            }
+            if (mac_all_zero || mac_all_ff || (net_config.mac[0] & 1u)) {
+                net_config.nic_present = 0;
+                klog("Network: Realtek returned an invalid station MAC.");
+                return;
+            }
+            memcpy(wired_mac_address, net_config.mac, 6);
+            wired_mac_valid = 1;
 
-            net_config.link_up = 1;
+            if (!rtl_init_rings()) {
+                net_config.link_up = 0;
+                klog("Network: Realtek RTL8111/8168 initialization failed.");
+                return;
+            }
+            net_config.link_up = (rtl_read8(RTL_REG_PHYSTATUS) & RTL_PHYSTATUS_LINK) != 0;
             klog("Network: Realtek RTL8111/8168 NIC initialized. MAC Address retrieved.");
-            rtl_init_rings();
             return;
         }
 
@@ -1991,6 +2234,21 @@ const char *net_status_string(void) {
         append_hex16(net_status_buf, &pos, sizeof(net_status_buf), net_config.nic_vendor_id);
         append_str(net_status_buf, &pos, sizeof(net_status_buf), " device=0x");
         append_hex16(net_status_buf, &pos, sizeof(net_status_buf), net_config.nic_device_id);
+        if (rtl_rings_ready) {
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), " rev=0x");
+            for (int i = 0; i < pci_device_count(); i++) {
+                pci_device_t *dev = pci_get_device(i);
+                if (dev && dev->vendor_id == net_config.nic_vendor_id &&
+                    dev->device_id == net_config.nic_device_id) {
+                    append_hex8(net_status_buf, &pos, sizeof(net_status_buf), dev->revision);
+                    break;
+                }
+            }
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), " xid=0x");
+            append_hex16(net_status_buf, &pos, sizeof(net_status_buf), rtl_xid);
+            if (rtl_is_8168h)
+                append_str(net_status_buf, &pos, sizeof(net_status_buf), " RTL8111H");
+        }
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n  mmio:     phys=0x");
         append_hex32(net_status_buf, &pos, sizeof(net_status_buf), net_config.nic_mmio_base);
         append_str(net_status_buf, &pos, sizeof(net_status_buf), ", virt=0x");
@@ -2002,6 +2260,17 @@ const char *net_status_string(void) {
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n");
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "  nic io:   ");
         append_str(net_status_buf, &pos, sizeof(net_status_buf), nic_rings_ready() ? "rx/tx rings ready\n" : "rings not initialized\n");
+        if (rtl_rings_ready) {
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), "  rtl dma:  rx=0x");
+            append_hex32(net_status_buf, &pos, sizeof(net_status_buf), rtl_rx_packets);
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), " rxerr=0x");
+            append_hex32(net_status_buf, &pos, sizeof(net_status_buf), rtl_rx_errors);
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), " tx=0x");
+            append_hex32(net_status_buf, &pos, sizeof(net_status_buf), rtl_tx_packets);
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), " txbusy=0x");
+            append_hex32(net_status_buf, &pos, sizeof(net_status_buf), rtl_tx_busy);
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n");
+        }
     } else {
         append_str(net_status_buf, &pos, sizeof(net_status_buf), "none\n");
     }
@@ -2020,6 +2289,223 @@ const char *net_status_string(void) {
     append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n  hostname: ");
     append_str(net_status_buf, &pos, sizeof(net_status_buf), net_config.hostname);
     append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n");
+    append_str(net_status_buf, &pos, sizeof(net_status_buf), "  wifi:     ");
+    const iwlwifi_state_t *wifi = iwlwifi_get_state();
+    if (wifi->present) {
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), "Intel AC 9560 device=0x");
+        append_hex16(net_status_buf, &pos, sizeof(net_status_buf), wifi->device_id);
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), " pci=");
+        append_u8(net_status_buf, &pos, sizeof(net_status_buf), wifi->bus);
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), ":");
+        append_u8(net_status_buf, &pos, sizeof(net_status_buf), wifi->slot);
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), ".");
+        append_u8(net_status_buf, &pos, sizeof(net_status_buf), wifi->function);
+        if (wifi->mac_address_valid) {
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), " mac=");
+            append_mac(net_status_buf, &pos, sizeof(net_status_buf), wifi->mac_address);
+        }
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->mmio_mapped ? " mmio=ready" : " mmio=unavailable");
+        if (wifi->hardware_rfkill) {
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), " rfkill=on");
+        }
+        if (wifi->mmio_bar_64bit) {
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->mmio_above_4g ? " bar64=>4G" : " bar64=<4G");
+        }
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->firmware_valid ? " firmware=valid" : " firmware=missing/invalid");
+        if (wifi->firmware_valid) {
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->dma_staging_ready ? " dma=staged" : " dma=unavailable");
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->rx_queue_ready ? " rxq=ready" : " rxq=unavailable");
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->rx_hw_programmed ? " rfh=on\n" : " rfh=off\n");
+            if (wifi->firmware_upload_started) {
+                append_str(net_status_buf, &pos, sizeof(net_status_buf), "            upload=");
+                append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->firmware_upload_complete ? "complete" : "failed/pending");
+                if (wifi->active_firmware_image == 1u) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " image=init");
+                } else if (wifi->active_firmware_image == 2u) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " image=runtime");
+                }
+                append_str(net_status_buf, &pos, sizeof(net_status_buf), wifi->firmware_alive ? " alive=yes" : " alive=no");
+                if (wifi->firmware_alive_status) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " status=");
+                    append_hex16(net_status_buf, &pos, sizeof(net_status_buf), wifi->firmware_alive_status);
+                }
+                if (wifi->firmware_upload_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf), (uint8_t)wifi->firmware_upload_error);
+                }
+                append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n");
+                append_str(net_status_buf, &pos, sizeof(net_status_buf), "            cmdq=");
+                append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                           wifi->command_queue_active ? "active" :
+                           (wifi->command_queue_dma_programmed ? "dma" :
+                           (wifi->command_queue_allocated ? "allocated" : "off")));
+                if (wifi->scd_base_addr) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " scd=0x");
+                    append_hex32(net_status_buf, &pos, sizeof(net_status_buf), wifi->scd_base_addr);
+                }
+                if (wifi->command_echo_sent) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               wifi->command_echo_complete ? " echo=ok" : " echo=failed");
+                }
+                if (wifi->nvm_ready) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " nvm=ready");
+                } else if (wifi->nvm_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " nvm-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->nvm_error);
+                }
+                if (wifi->phy_db_ready) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " phydb=ready");
+                } else if (wifi->calibration_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf), " calib-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->calibration_error);
+                }
+                if (wifi->transport_restart_complete) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " restart=ok");
+                } else if (wifi->transport_restart_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " restart-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->transport_restart_error);
+                }
+                if (wifi->paging_ready) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " paging=ready");
+                } else if (wifi->paging_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " paging-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->paging_error);
+                }
+                if (wifi->runtime_configured) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " runtime=ready");
+                } else if (wifi->runtime_config_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " runtime-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->runtime_config_error);
+                }
+                if (wifi->auxiliary_station_ready) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " aux-sta=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->auxiliary_station_id);
+                }
+                if (wifi->phy_contexts_ready) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " phy-ctx=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->phy_contexts_ready);
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " initial-ch=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->nvm_initial_channel);
+                }
+                if (wifi->scan_configured) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " scan-channels=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->scan_config_channels);
+                }
+                if (wifi->scan_active) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " scan=active");
+                } else if (wifi->scan_complete) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " scan=complete status=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->scan_complete_status);
+                } else if (wifi->scan_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " scan-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->scan_error);
+                }
+                if (wifi->scan_result_count) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " results=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->scan_result_count);
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " frames=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->scan_frames);
+                    uint32_t shown = wifi->scan_result_count < 4u ?
+                                     wifi->scan_result_count : 4u;
+                    for (uint32_t i = 0; i < shown; i++) {
+                        const iwlwifi_scan_result_t *ap =
+                            &wifi->scan_results[i];
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf), "\n              ");
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf), "#");
+                        append_u8(net_status_buf, &pos,
+                                  sizeof(net_status_buf), (uint8_t)i);
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf), " ");
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf),
+                                   ap->ssid_length ? ap->ssid : "<hidden>");
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf), " bssid=");
+                        append_mac(net_status_buf, &pos,
+                                   sizeof(net_status_buf), ap->bssid);
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf), " ch=");
+                        append_u8(net_status_buf, &pos,
+                                  sizeof(net_status_buf), ap->channel);
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf), " rssi=");
+                        append_i8(net_status_buf, &pos,
+                                  sizeof(net_status_buf), ap->rssi_dbm);
+                        append_str(net_status_buf, &pos,
+                                   sizeof(net_status_buf),
+                                   ap->rsn ? "dBm rsn" : "dBm open/legacy");
+                    }
+                }
+                if (wifi->association_context_ready) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " assoc-ctx=ready network=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->association_network);
+                }
+                if (wifi->link_associated) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " associated aid=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->association_id);
+                } else if (wifi->association_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " assoc-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->association_error);
+                }
+                if (wifi->wpa2_stage) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " wpa2-stage=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              wifi->wpa2_stage);
+                }
+                if (wifi->wpa2_error) {
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " wpa2-error=");
+                    append_u8(net_status_buf, &pos, sizeof(net_status_buf),
+                              (uint8_t)wifi->wpa2_error);
+                }
+                if (wifi->link_security_ready)
+                    append_str(net_status_buf, &pos, sizeof(net_status_buf),
+                               " security=ready");
+                append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n");
+            }
+        } else {
+            append_str(net_status_buf, &pos, sizeof(net_status_buf), "\n");
+        }
+    } else {
+        append_str(net_status_buf, &pos, sizeof(net_status_buf), "Intel AC 9560 not detected\n");
+    }
 
     return net_status_buf;
 }
@@ -2099,9 +2585,10 @@ static void dhcp_send_request(void) {
     net_send_udp(bcast4, DHCP_PORT_SERVER, DHCP_PORT_CLIENT, buf, pkt_len);
 }
 
-static void dhcp_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void dhcp_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                              uint16_t src_port,
                               const uint8_t *payload, uint16_t len) {
-    (void)src_ip; (void)src_port;
+    (void)src_ip; (void)src_mac; (void)src_port;
     if (len < (uint16_t)sizeof(dhcp_packet_t)) return;
     const dhcp_packet_t *pkt = (const dhcp_packet_t *)payload;
 
@@ -2215,9 +2702,10 @@ static uint16_t dns_skip_name(const uint8_t *pkt, uint16_t pos, uint16_t len) {
     return pos;
 }
 
-static void dns_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void dns_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                             uint16_t src_port,
                              const uint8_t *payload, uint16_t len) {
-    (void)src_ip; (void)src_port;
+    (void)src_ip; (void)src_mac; (void)src_port;
     if (len < 12) return;
     uint16_t id = ((uint16_t)payload[0] << 8) | payload[1];
     if (id != dns_txid) return;
@@ -2517,7 +3005,8 @@ static void net_rsh_execute(const char *cmd, char *out, uint32_t out_size) {
     }
 }
 
-static void net_rsh_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
+static void net_rsh_udp_handler(const uint8_t src_ip[4], const uint8_t src_mac[6],
+                                 uint16_t src_port,
                                  const uint8_t *payload, uint16_t len) {
     char cmd[128];
     static char response[960];
@@ -2533,8 +3022,8 @@ static void net_rsh_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
         if (to_copy <= tlen + 1 ||
             memcmp(cmd, net_rsh_token, tlen) != 0 ||
             cmd[tlen] != ' ') {
-            net_send_udp(src_ip, src_port, net_rsh_port,
-                         (const uint8_t *)"ERR unauthorized\n", 17);
+            net_send_udp_to_mac(src_ip, src_mac, src_port, net_rsh_port,
+                                (const uint8_t *)"ERR unauthorized\n", 17);
             return;
         }
         actual_cmd = cmd + tlen + 1;
@@ -2545,7 +3034,8 @@ static void net_rsh_udp_handler(const uint8_t src_ip[4], uint16_t src_port,
 
     uint16_t resp_len = (uint16_t)strlen(response);
     if (resp_len == 0) { response[0] = '\n'; resp_len = 1; }
-    net_send_udp(src_ip, src_port, net_rsh_port, (const uint8_t *)response, resp_len);
+    net_send_udp_to_mac(src_ip, src_mac, src_port, net_rsh_port,
+                        (const uint8_t *)response, resp_len);
 }
 
 int net_rsh_set_enabled(int enabled) {
@@ -2668,7 +3158,13 @@ int net_load_config_text(const char *text, uint32_t size) {
 
         if (key_equals(key, "mode")) {
             if (strcmp(value, "dhcp") == 0) {
-                applied |= net_config_dhcp();
+                /* Parsing happens during boot before the scheduler is running.
+                 * Record the requested mode here; the network task performs
+                 * the blocking DHCP exchange once timer-driven scheduling is
+                 * available. */
+                net_config.mode = NET_MODE_DHCP;
+                net_config.has_config = 0;
+                applied = 1;
             } else if (strcmp(value, "static") == 0) {
                 static_seen = 1;
             }
@@ -2782,25 +3278,28 @@ int net_save_config(void) {
     return 1;
 }
 
-/* Runs once, the first time net_poll_task executes -- safe here (unlike
- * directly in kernel_main()) because this only starts running once IRQ0 is
- * actually driving task_switch(), which requires interrupts already
- * globally enabled; net_config_dhcp()'s tick-based wait loops would hang
- * forever if called any earlier (same trap already documented for
- * UHCI/HTTP in ROADMAP.md). Auto-enables remote access (DHCP + RSH + the
- * UDP LLM query service) unconditionally so a headless boot -- no working
- * local video output, e.g. real UEFI-only hardware without a GOP mode
- * GRUB can use, see ROADMAP.md "Boot UEFI nativo" -- still has SOME way
- * in, without needing a FAT32 net.cfg on a storage device this kernel's
- * legacy ATA/UHCI-only drivers likely can't see on modern hardware
- * either. Both services ship with no auth token by default (same as their
- * existing "rsh"/"llm net" shell commands did before this) -- intentional
- * for a bring-up/diagnostic build, not meant as a hardened default. */
+/* Runs once after timer-driven scheduling is available (net_poll_task only
+ * starts once IRQ0 is actually driving task_switch(), which requires
+ * interrupts already globally enabled -- net_config_dhcp()'s tick-based
+ * wait loops would hang forever if called any earlier). A static
+ * configuration loaded from disk is already complete and must not be
+ * overwritten by DHCP.
+ *
+ * RSH + the LLM UDP service are auto-enabled unconditionally: this is the
+ * only way in on hardware with no working local video output (e.g. a
+ * UEFI-only board whose GOP reports no usable mode to GRUB -- see
+ * "Roadmap de Arranque en Hardware Real" in ROADMAP.md), where a human
+ * can't type "rsh on" into a shell they can't see. Both services ship with
+ * no auth token by default, same as their shell-command equivalents --
+ * intentional for a bring-up/diagnostic build, not a hardened default for
+ * permanent deployment. */
 static void net_poll_task_autoconfig(void) {
-    net_config_dhcp();
+    if (net_config.mode == NET_MODE_DHCP && !net_config.has_config) {
+        net_config_dhcp();
+    }
     net_rsh_set_enabled(1);
     net_llm_service_set_enabled(1);
-    klog("Net: DHCP + remote shell (RSH) + LLM UDP service auto-enabled for headless access.");
+    klog("Net: remote shell (RSH) + LLM UDP service auto-enabled for headless access.");
 }
 
 void net_poll_task(void) {

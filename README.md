@@ -305,10 +305,29 @@ hostname=microk
 `make qemu-net` boots MicroK with a QEMU e1000 NIC, forwards host UDP port
 `1234` to guest UDP port `1234`, and writes this static config into
 `/microk/net.cfg` inside the FAT32 image. MicroK can detect the e1000 PCI
-device, read/report its MAC address, initialize experimental RX/TX descriptor
-rings, and report vendor/device/BARs in `net status`. The driver uses polling
-from the shell loop; interrupts, ICMP, DHCP, TCP, and broader IPv4 routing are
-still pending.
+device, read/report its MAC address, initialize RX/TX descriptor rings, and
+report vendor/device/BARs in `net status`. The shared polling stack implements
+ARP, ICMP, DHCP, UDP, DNS and a minimal TCP/HTTP client. It also supports the
+Realtek RTL8111/8168 (`10EC:8168`). The physical target is an RTL8111H on an
+ASRock B450M Pro4 R2.0 (`1849:8168`, PCI REV 15); the driver detects its MAC
+XID `0x541`, applies the generation-specific RX, MaxTx and power-state setup,
+and reports DMA counters in `net status`.
+
+Intel Wireless-AC 9560 setup and connection commands are:
+
+```text
+net wifi scan
+net status
+net wifi associate <result-index>                 # open network
+net wifi connect <result-index> <WPA2-passphrase> # WPA2-PSK/CCMP
+net config dhcp
+```
+
+The Wi-Fi transport loads API-46 firmware from
+`/microk/iwlwifi-9000-pu-b0-jf-b0-46.ucode`, configures DMA/PHY/MAC/binding
+contexts, performs the EAPOL four-way handshake and exposes 802.11 traffic to
+the same Ethernet/IP stack. Real AC 9560 validation still requires booting the
+image on a machine containing that adapter; QEMU has no AC 9560 device model.
 
 The experimental LLM service protocol is:
 

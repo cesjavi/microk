@@ -1,5 +1,6 @@
 #include "ai_hooks.h"
 #include "boot_modules.h"
+#include "iwlwifi.h"
 #include "extfs.h"
 #include "fat32.h"
 #include "gdt.h"
@@ -275,6 +276,14 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     storage_init();
 
     klog("Initializing Network Config...");
+    uint32_t wifi_firmware_start, wifi_firmware_size;
+    if (boot_module_find(mbi, "iwlwifi", &wifi_firmware_start,
+                         &wifi_firmware_size)) {
+        iwlwifi_set_boot_firmware(
+            (const uint8_t *)(uintptr_t)wifi_firmware_start,
+            wifi_firmware_size);
+        klog("WiFi: Intel API-46 firmware module available at boot.");
+    }
     net_init();
     net_detect_pci();
     load_net_config_from_storage();

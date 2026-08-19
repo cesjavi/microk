@@ -13,6 +13,23 @@ static int module_name_matches(const char *name, const char *token) {
     return name && token && strstr(name, token) != 0;
 }
 
+int boot_module_find(multiboot_info_t *mbi, const char *name_token,
+                     uint32_t *start, uint32_t *size) {
+    if (!mbi || !name_token || !start || !size ||
+        !(mbi->flags & MULTIBOOT_FLAG_MODS)) return 0;
+    multiboot_module_t *mods = (multiboot_module_t *)mbi->mods_addr;
+    for (uint32_t i = 0; i < mbi->mods_count; i++) {
+        const char *name = (const char *)mods[i].string;
+        if (module_name_matches(name, name_token) &&
+            mods[i].mod_end > mods[i].mod_start) {
+            *start = mods[i].mod_start;
+            *size = mods[i].mod_end - mods[i].mod_start;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int module_is_initrd(const char *name) {
     return module_name_matches(name, "initrd") ||
            module_name_matches(name, "ramdisk");
@@ -23,6 +40,11 @@ static int module_is_model(const char *name) {
            module_name_matches(name, "llm") ||
            module_name_matches(name, "gguf") ||
            module_name_matches(name, "weights");
+}
+
+static int module_is_firmware(const char *name) {
+    return module_name_matches(name, "iwlwifi") ||
+           module_name_matches(name, "ucode");
 }
 
 static int module_has_model_magic(multiboot_module_t *mod) {
@@ -37,12 +59,15 @@ static int module_has_model_magic(multiboot_module_t *mod) {
 void boot_modules_load(multiboot_info_t *mbi) {
     int initrd_loaded = 0;
     int model_loaded = 0;
+    int firmware_seen = 0;
 
     if ((mbi->flags & MULTIBOOT_FLAG_MODS) && mbi->mods_count > 0) {
         multiboot_module_t *mods = (multiboot_module_t *)mbi->mods_addr;
         for (uint32_t i = 0; i < mbi->mods_count; i++) {
             const char *name = (const char *)mods[i].string;
-            if (!initrd_loaded && module_is_initrd(name)) {
+            if (module_is_firmware(name)) {
+                firmware_seen = 1;
+            } else if (!initrd_loaded && module_is_initrd(name)) {
                 klog("Loading Initrd Module...");
                 initialise_initrd(mods[i].mod_start, mods[i].mod_end);
                 initrd_loaded = 1;
@@ -53,7 +78,8 @@ void boot_modules_load(multiboot_info_t *mbi) {
             }
         }
 
-        if (!initrd_loaded && mbi->mods_count == 1 && !model_loaded) {
+        if (!initrd_loaded && mbi->mods_count == 1 && !model_loaded &&
+            !firmware_seen) {
             klog("Loading Initrd Module...");
             initialise_initrd(mods[0].mod_start, mods[0].mod_end);
         }

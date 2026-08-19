@@ -173,9 +173,9 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             }
             break;
         case 25: // Net Status String
-            if (uptr_ok(arg1, 256)) {
-                strncpy((char *)arg1, net_status_string(), 255);
-                ((char *)arg1)[255] = '\0';
+            if (uptr_ok(arg1, 1024)) {
+                strncpy((char *)arg1, net_status_string(), 1023);
+                ((char *)arg1)[1023] = '\0';
             }
             break;
         case 26: // Net Config DHCP
@@ -420,6 +420,23 @@ uint32_t syscall_handler(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
                 } else {
                     retval = (uint32_t)-1;
                 }
+            }
+            break;
+        case 64: // Intel WiFi passive scan
+            retval = (uint32_t)net_wifi_scan();
+            break;
+        case 65: // Intel WiFi open-system auth + association, arg1=result index
+            retval = arg1 < 16u ?
+                     (uint32_t)net_wifi_associate((uint8_t)arg1) : 0;
+            break;
+        case 66: // Intel WiFi WPA2-PSK, arg1=result index, arg2=passphrase
+            if (arg1 < 16u && uptr_ok(arg2, 64u)) {
+                char passphrase[64];
+                memcpy(passphrase, (const void *)arg2, sizeof(passphrase));
+                passphrase[sizeof(passphrase) - 1u] = '\0';
+                retval = (uint32_t)net_wifi_connect_wpa2(
+                    (uint8_t)arg1, passphrase);
+                memset(passphrase, 0, sizeof(passphrase));
             }
             break;
         default:

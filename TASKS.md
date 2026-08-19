@@ -123,6 +123,40 @@
 - [x] Implementar cliente DHCP Discover/Offer/Request/Ack.
 - [x] Implementar DNS A record resolver + `nslookup <host>`.
 - [x] Agregar `make qemu-net`.
+- [x] Detectar Intel Wireless-AC 9560 (PCI IDs iwlwifi 9000/CNVi) y mostrar su estado separado de Ethernet.
+- [x] Seleccionar Realtek PCIe GbE `10EC:8168` (RTL8111H, `1849:8168`, REV 15) como backend Ethernet soportado.
+- [x] Realtek 8168: pad TX a 60 bytes, retirar FCS RX, rechazar fragmentos y ordenar transferencias de ownership DMA.
+- [x] RTL8111H: detectar XID `0x541`, aplicar configuracion RX/MaxTx especifica, limpiar estados PFM/D3cold y publicar contadores DMA.
+- [x] Arrancar MicroK en la RTL8111H fisica y verificar enlace, DHCP, ping y contadores RX/TX sin errores. Verificado: link up, lease DHCP real (visible en el cliente del router), `ping` responde TTL=64 <1ms de forma estable, y UDP bidireccional (RSH `PING`->`PONG`) funciona end-to-end. Ver detalle en ROADMAP.md, "Hallazgos de la sesion de bring-up en laptop real". Contadores RX/TX explicitos sin revisar por separado (no se pudo leer `net status` sin pantalla).
+- [x] Intel Wireless-AC 9560: localizar y validar firmware TLV `iwlwifi-9000-pu-b0-jf-b0-46.ucode` desde FAT32.
+- [x] Intel Wireless-AC 9560: catalogar por separado secciones INIT/runtime con offsets y limites DMA.
+- [x] Intel Wireless-AC 9560: preservar separadores CPU/paging y preparar staging DMA FH de 128 KiB.
+- [x] Intel Wireless-AC 9560: mapear ventanas CSR/FH y capturar revision/estado inicial sin escribir al radio.
+- [x] Intel Wireless-AC 9560: aceptar BAR0 de 64 bits direccionable bajo 4 GiB y rechazar solo MMIO realmente inaccesible.
+- [x] Agregar firmware API 46 oficial y test estructural contra la imagen TLV real.
+- [x] Intel Wireless-AC 9560: preparar RBD MQ de 512 entradas, IDs virtuales, status y buffers RX de 4 KiB.
+- [x] Intel Wireless-AC 9560: adquirir propiedad PCI/MAC y programar RFH queue 0 con timeouts.
+- [x] Intel Wireless-AC 9560: implementar transferencia FH de secciones en chunks de 128 KiB con completion y timeout.
+- [x] Intel Wireless-AC 9560: publicar buffers RX MQ y validar la notificacion `ALIVE` con timeout y estado CAFE.
+- [x] Intel Wireless-AC 9560: reservar TFD/host-command DMA, keep-warm y extraer `scd_base_ptr` desde `ALIVE`.
+- [x] Intel Wireless-AC 9560: inicializar SRAM SCD, byte-count table, FIFO 7 y canales TX para command queue 0.
+- [x] Intel Wireless-AC 9560: emitir `ECHO_CMD` por TFD y correlacionar su respuesta RX por secuencia.
+- [x] Intel Wireless-AC 9560: arrancar INIT ucode y generalizar host commands sobre un ring circular.
+- [x] Intel Wireless-AC 9560: leer secciones NVM por firmware y obtener la MAC desde CSR strap/OTP.
+- [x] Intel Wireless-AC 9560: enviar TX antenna/PHY config y recolectar notificaciones PHY DB.
+- [x] Intel Wireless-AC 9560: ejecutar INIT ucode, leer NVM y recolectar PHY DB/calibracion antes de runtime.
+- [x] Intel Wireless-AC 9560: reiniciar transporte, cargar runtime, configurar paging y reinyectar PHY DB.
+- [x] Intel Wireless-AC 9560: validar la tabla CMD_VERSIONS de API 46 (scan config/request, ADD_STA y PHY context).
+- [x] Intel Wireless-AC 9560: reciclar buffers RX MQ y republicar el write pointer para operacion continua.
+- [x] Intel Wireless-AC 9560: habilitar DQA, cola auxiliar SCD 1 y estacion auxiliar ADD_STA v10.
+- [x] Intel Wireless-AC 9560: validar canales regulatorios NVM y crear los tres contextos PHY iniciales.
+- [x] Intel Wireless-AC 9560: configurar UMAC scan, emitir scan pasivo v8 y procesar completion asincrono.
+- [x] Intel Wireless-AC 9560: decodificar RX PHY/MPDU, validar CRC y listar redes por BSSID, SSID, canal, RSSI y RSN.
+- [x] Intel Wireless-AC 9560: implementar contextos MAC/binding y TX/RX 802.11 para autenticacion y asociacion abierta.
+- [x] Intel Wireless-AC 9560: implementar WPA2-PSK (PBKDF2/PTK, EAPOL 4-way, MIC, AES unwrap y claves CCMP/GTK).
+- [ ] Intel Wireless-AC 9560: validar INIT/runtime/PHY DB sobre hardware 9560 real.
+- [x] Intel Wireless-AC 9560: cargar secciones del firmware al dispositivo y levantar transporte DMA.
+- [x] Intel Wireless-AC 9560: implementar scan/asociacion 802.11 y WPA2 antes de exponerla al stack IP.
 
 ## LLM Remoto por Red
 

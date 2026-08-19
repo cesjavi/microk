@@ -12,9 +12,9 @@ CFLAGS = -m32 -ffreestanding -O3 -Wall -Wextra -fno-stack-protector -fno-pic -ms
 LDFLAGS = -m elf_i386 -T kernel/linker.ld
 
 KERNEL_BIN = build/kernel.bin
-OBJ = kernel/boot.o kernel/main.o kernel/boot_modules.o kernel/shell.o kernel/gdt.o kernel/idt.o kernel/interrupts.o kernel/timer.o kernel/pmm.o kernel/vmm.o kernel/vmm_pae.o kernel/highmem.o kernel/ipc.o kernel/task.o kernel/syscall.o kernel/keyboard.o kernel/llm.o kernel/llm_gguf.o kernel/tensor.o kernel/tokenizer.o lib/string.o lib/math.o kernel/kheap.o kernel/vfs.o kernel/blockdev.o kernel/ata.o kernel/uhci.o kernel/partition.o kernel/storage.o kernel/extfs.o kernel/ntfs.o kernel/fat32.o kernel/pci.o kernel/gpu.o kernel/net.o kernel/initrd.o kernel/video.o kernel/speaker.o kernel/font.o kernel/serial.o kernel/ai_hooks.o kernel/spinlock.o
+OBJ = kernel/boot.o kernel/main.o kernel/boot_modules.o kernel/shell.o kernel/gdt.o kernel/idt.o kernel/interrupts.o kernel/timer.o kernel/pmm.o kernel/vmm.o kernel/vmm_pae.o kernel/highmem.o kernel/ipc.o kernel/task.o kernel/syscall.o kernel/keyboard.o kernel/llm.o kernel/llm_gguf.o kernel/tensor.o kernel/tokenizer.o lib/string.o lib/math.o kernel/kheap.o kernel/vfs.o kernel/blockdev.o kernel/ata.o kernel/uhci.o kernel/partition.o kernel/storage.o kernel/extfs.o kernel/ntfs.o kernel/fat32.o kernel/pci.o kernel/gpu.o kernel/wpa2_crypto.o kernel/iwlwifi.o kernel/net.o kernel/initrd.o kernel/video.o kernel/speaker.o kernel/font.o kernel/serial.o kernel/ai_hooks.o kernel/spinlock.o
 
-.PHONY: all test-model test-netcfg clean image-mklm image-gguf image-net image-ext2 image-usb iso qemu qemu-gguf qemu-stories15 qemu-net qemu-nvidia qemu-highmem qemu-ext2 qemu-usb
+.PHONY: all test-model test-netcfg test-iwlwifi test-wpa2 clean image-mklm image-gguf image-net image-ext2 image-usb iso qemu qemu-gguf qemu-stories15 qemu-net qemu-nvidia qemu-highmem qemu-ext2 qemu-usb
 
 all: $(KERNEL_BIN)
 
@@ -24,6 +24,13 @@ test-model:
 test-netcfg:
 	$(CC) -Wall -Wextra -o build/net_config_parser_test scripts/net_config_parser_test.c
 	./build/net_config_parser_test
+
+test-iwlwifi:
+	$(PYTHON) scripts/test_iwlwifi_firmware.py
+
+test-wpa2:
+	$(CC) -O2 -Wall -Wextra -Ilib -Ikernel -o build/wpa2_crypto_test scripts/wpa2_crypto_test.c kernel/wpa2_crypto.c
+	./build/wpa2_crypto_test
 
 lib/%.o: lib/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -73,7 +80,8 @@ $(KERNEL_BIOS_BIN): $(BIOS_OBJ)
 iso: $(KERNEL_BIOS_BIN)
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp $(KERNEL_BIOS_BIN) $(ISO_DIR)/boot/kernel.bin
-	printf 'set timeout=0\nset default=0\n\nmenuentry "MicroK" {\n\tmultiboot /boot/kernel.bin\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
+	cp firmware/iwlwifi-9000-pu-b0-jf-b0-46.ucode $(ISO_DIR)/boot/iwlwifi-9000-pu-b0-jf-b0-46.ucode
+	printf 'set timeout=0\nset default=0\n\nmenuentry "MicroK" {\n\tmultiboot /boot/kernel.bin\n\tmodule /boot/iwlwifi-9000-pu-b0-jf-b0-46.ucode iwlwifi-api46\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
 	grub-mkrescue -o microk.iso $(ISO_DIR)
 
 image-mklm: $(KERNEL_BIN)
@@ -122,9 +130,11 @@ image-net: $(KERNEL_BIN)
 	mcopy -i storage.img model.mklm ::/model.mklm
 	mmd -i storage.img ::/models
 	mcopy -i storage.img model.mklm ::/models/model.mklm
-	for f in *.gguf; do [ -f "$$f" ] || continue; mcopy -o -i storage.img "$$f" ::/"$$f"; mcopy -o -i storage.img "$$f" ::/models/"$$f"; done
+	# The network image boots its model through -initrd. Do not copy arbitrary
+	# local GGUF files: a 638MB model would overflow this 512MB FAT image.
 	mmd -i storage.img ::/microk
 	mcopy -i storage.img net.cfg ::/microk/net.cfg
+	mcopy -i storage.img firmware/iwlwifi-9000-pu-b0-jf-b0-46.ucode ::/microk/iwlwifi-9000-pu-b0-jf-b0-46.ucode
 
 qemu-net: image-net
 	$(QEMU) -kernel build/kernel.bin -initrd stories15M.gguf -drive file=storage.img,format=raw,index=0,media=disk -netdev user,id=net0,hostfwd=udp::1234-:1234 -device e1000,netdev=net0 -vga std -m 256M -serial stdio $(QEMU_ACCEL_ARGS)

@@ -57,7 +57,7 @@ static int gguf_find_metadata_entry(uint32_t start, uint32_t size, uint32_t meta
 static int gguf_get_metadata_array_from_info(uint32_t start, uint32_t size, gguf_info_t *info, const char *key, uint32_t *out_count, uint8_t **out_ptr) {
     uint8_t *base = (uint8_t *)(uintptr_t)start;
     uint32_t val_type;
-    uint32_t value_offset;
+    uint32_t value_offset = 0;
 
     if (!info) return 0;
     if (!gguf_find_metadata_entry(start, size, info->metadata_offset, info->metadata_count, key, &val_type, &value_offset)) {

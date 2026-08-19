@@ -47,6 +47,7 @@ static void pci_add_device(uint8_t bus, uint8_t slot, uint8_t function) {
     device->device_id = (uint16_t)(id >> 16);
 
     uint32_t class_info = pci_config_read32(bus, slot, function, 0x08);
+    device->revision = (uint8_t)(class_info & 0xFF);
     device->prog_if = (uint8_t)((class_info >> 8) & 0xFF);
     device->subclass = (uint8_t)((class_info >> 16) & 0xFF);
     device->class_code = (uint8_t)((class_info >> 24) & 0xFF);

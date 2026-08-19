@@ -1,7 +1,7 @@
 import socket
 import sys
 
-def query_microk(prompt, ip="10.0.2.15", port=1234):
+def query_microk(prompt, ip="192.168.1.22", port=1234):
     """
     Envia un prompt de IA al MicroK Kernel via UDP.
     """

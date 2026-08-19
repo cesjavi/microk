@@ -14,6 +14,7 @@ typedef struct {
     uint8_t class_code;
     uint8_t subclass;
     uint8_t prog_if;
+    uint8_t revision;
     uint8_t header_type;
     uint32_t bar[6];
 } pci_device_t;

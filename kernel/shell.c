@@ -63,7 +63,10 @@ enum {
     SYS_HBUF_SELFTEST = 60,
     SYS_USB_STATUS_STR = 61,
     SYS_USB_MSD_TEST_STR = 62,
-    SYS_HTTP_GET = 63
+    SYS_HTTP_GET = 63,
+    SYS_NET_WIFI_SCAN = 64,
+    SYS_NET_WIFI_ASSOCIATE = 65,
+    SYS_NET_WIFI_CONNECT_WPA2 = 66
 };
 
 /* Mirrors the identically-named struct in kernel/syscall.c -- fixed-size
@@ -319,6 +322,29 @@ static inline void syscall_llm_net_status_str(char *buf) {
 
 static inline void syscall_net_poll(void) {
     asm volatile ("int $0x80" : : "a"(SYS_NET_POLL) : "memory");
+}
+
+static inline int syscall_net_wifi_scan(void) {
+    int result;
+    asm volatile ("int $0x80" : "=a"(result) : "a"(SYS_NET_WIFI_SCAN) : "memory");
+    return result;
+}
+
+static inline int syscall_net_wifi_associate(uint8_t index) {
+    int result;
+    asm volatile ("int $0x80" : "=a"(result) :
+                  "a"(SYS_NET_WIFI_ASSOCIATE), "c"((uint32_t)index) :
+                  "memory");
+    return result;
+}
+
+static inline int syscall_net_wifi_connect_wpa2(uint8_t index,
+                                                const char *passphrase) {
+    int result;
+    asm volatile ("int $0x80" : "=a"(result) :
+                  "a"(SYS_NET_WIFI_CONNECT_WPA2), "c"((uint32_t)index),
+                  "d"(passphrase) : "memory");
+    return result;
 }
 
 static inline int syscall_llm_net_port(uint16_t port) {
@@ -948,7 +974,7 @@ static void shell_handle_command(char *line) {
         syscall_put_char('\n');
         shell_run_llm_query(line + 1);
     } else if (strcmp(line, "help") == 0) {
-        syscall_print("Commands: help, clear, status, mem, mem map, mem test, highmemtest, highmemtest buf, heaptest, ls [dir], cat <file>, cd <dir>, loadmodel <file>, extls, extcat <file>, fs, gpu, gpu info, net status, net config dhcp, net config static <ip> <mask> <gw>, net config save, ipc shmtest, dhcp renew, arp, ping <ip>, nslookup <host>, rsh on|off|status|port <p>|token <t|off>, llm status, llm info, llm selftest, llm selftest gguf, llm trace on|off|status, llm net on|off|status|port <p>|token <t|off>, llm ask <p>, llm logits <p>, llm chat <p>, usb, usb msdtest, usb msdwritetest, http get <host> <path>, !<p>\n");
+        syscall_print("Commands: help, clear, status, mem, mem map, mem test, highmemtest, highmemtest buf, heaptest, ls [dir], cat <file>, cd <dir>, loadmodel <file>, extls, extcat <file>, fs, gpu, gpu info, net status, net wifi scan, net wifi associate <index>, net wifi connect <index> <passphrase>, net config dhcp, net config static <ip> <mask> <gw>, net config save, ipc shmtest, dhcp renew, arp, ping <ip>, nslookup <host>, rsh on|off|status|port <p>|token <t|off>, llm status, llm info, llm selftest, llm selftest gguf, llm trace on|off|status, llm net on|off|status|port <p>|token <t|off>, llm ask <p>, llm logits <p>, llm chat <p>, usb, usb msdtest, usb msdwritetest, http get <host> <path>, !<p>\n");
     } else if (strcmp(line, "ls") == 0) {
         syscall_fat_ls(shell_cwd[0] ? shell_cwd : 0);
     } else if (strstr(line, "ls ") == line) {
@@ -995,13 +1021,56 @@ static void shell_handle_command(char *line) {
     } else if (strstr(line, "http get ") == line) {
         shell_http_get(line + 9);
     } else if (strcmp(line, "net status") == 0) {
-        char buf[256];
+        char buf[1024];
         syscall_net_status_str(buf);
         syscall_print(buf);
+    } else if (strcmp(line, "net wifi scan") == 0) {
+        if (syscall_net_wifi_scan())
+            syscall_print("WiFi: passive scan started. Use net status for progress.\n");
+        else
+            syscall_print("WiFi: scan could not start; see net status.\n");
+    } else if (strstr(line, "net wifi associate ") == line) {
+        const char *number = line + 19;
+        uint32_t index = 0;
+        int valid = *number != '\0';
+        while (*number) {
+            if (*number < '0' || *number > '9') {
+                valid = 0;
+                break;
+            }
+            index = index * 10u + (uint32_t)(*number++ - '0');
+            if (index >= 16u) valid = 0;
+        }
+        if (!valid)
+            syscall_print("Usage: net wifi associate <result-index 0..15>\n");
+        else if (syscall_net_wifi_associate((uint8_t)index))
+            syscall_print("WiFi: 802.11 association completed.\n");
+        else
+            syscall_print("WiFi: association failed; see net status.\n");
+    } else if (strstr(line, "net wifi connect ") == line) {
+        char *arguments = line + 17;
+        char *space = strchr(arguments, ' ');
+        uint32_t index = 0;
+        int valid = space != NULL && space != arguments;
+        for (char *p = arguments; valid && p < space; p++) {
+            if (*p < '0' || *p > '9') valid = 0;
+            else index = index * 10u + (uint32_t)(*p - '0');
+        }
+        if (!valid || index >= 16u || strlen(space + 1u) < 8u ||
+            strlen(space + 1u) > 63u) {
+            syscall_print("Usage: net wifi connect <index 0..15> <WPA2 passphrase>\n");
+        } else if (syscall_net_wifi_connect_wpa2((uint8_t)index, space + 1u)) {
+            syscall_print("WiFi: WPA2 link established; run net config dhcp.\n");
+        } else {
+            syscall_print("WiFi: WPA2 connection failed; see net status.\n");
+        }
     } else if (strcmp(line, "net config dhcp") == 0 || strcmp(line, "dhcp renew") == 0) {
         syscall_print("DHCP: sending Discover...\n");
         if (syscall_net_config_dhcp()) {
-            char buf[256];
+            /* SYS_NET_STATUS_STR validates and may fill the full 1024-byte
+             * ABI buffer; using 256 bytes here corrupted the ring-3 stack
+             * after every successful DHCP lease. */
+            char buf[1024];
             syscall_net_status_str(buf);
             syscall_print("DHCP: lease acquired.\n");
             syscall_print(buf);
