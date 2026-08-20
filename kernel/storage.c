@@ -1,6 +1,7 @@
 #include "storage.h"
 #include "ata.h"
 #include "uhci.h"
+#include "ehci.h"
 #include "blockdev.h"
 #include "partition.h"
 #include "vfs.h"
@@ -8,6 +9,17 @@
 
 void storage_init() {
     blockdev_init();
+
+    /* USB 2.0 (EHCI) Etapa 0+1: controller detection, BIOS handoff, and
+     * root port reset/enable only -- no enumeration/transfers yet (see
+     * ROADMAP.md, "Etapa 3: Controlador USB moderno minimo"). Independent
+     * of the UHCI driver below: a machine can have either, both (EHCI +
+     * a UHCI/OHCI companion for full/low-speed devices), or neither. */
+    if (ehci_init() == 0) {
+        klog(ehci_status_string());
+    } else {
+        klog("USB: no EHCI controller found.\n");
+    }
 
     /* USB Mass Storage Etapa 0+1: controller detection and port reset only --
      * no block_device_t yet (needs enumeration + Bulk-Only Transport first,

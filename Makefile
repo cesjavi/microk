@@ -12,7 +12,7 @@ CFLAGS = -m32 -ffreestanding -O3 -Wall -Wextra -fno-stack-protector -fno-pic -ms
 LDFLAGS = -m elf_i386 -T kernel/linker.ld
 
 KERNEL_BIN = build/kernel.bin
-OBJ = kernel/boot.o kernel/main.o kernel/boot_modules.o kernel/shell.o kernel/gdt.o kernel/idt.o kernel/interrupts.o kernel/timer.o kernel/pmm.o kernel/vmm.o kernel/vmm_pae.o kernel/highmem.o kernel/ipc.o kernel/task.o kernel/syscall.o kernel/keyboard.o kernel/llm.o kernel/llm_gguf.o kernel/tensor.o kernel/tokenizer.o lib/string.o lib/math.o kernel/kheap.o kernel/vfs.o kernel/blockdev.o kernel/ata.o kernel/uhci.o kernel/partition.o kernel/storage.o kernel/extfs.o kernel/ntfs.o kernel/fat32.o kernel/pci.o kernel/gpu.o kernel/wpa2_crypto.o kernel/iwlwifi.o kernel/net.o kernel/initrd.o kernel/video.o kernel/speaker.o kernel/font.o kernel/serial.o kernel/ai_hooks.o kernel/spinlock.o
+OBJ = kernel/boot.o kernel/main.o kernel/boot_modules.o kernel/shell.o kernel/gdt.o kernel/idt.o kernel/interrupts.o kernel/timer.o kernel/pmm.o kernel/vmm.o kernel/vmm_pae.o kernel/highmem.o kernel/ipc.o kernel/task.o kernel/syscall.o kernel/keyboard.o kernel/llm.o kernel/llm_gguf.o kernel/tensor.o kernel/tokenizer.o lib/string.o lib/math.o kernel/kheap.o kernel/vfs.o kernel/blockdev.o kernel/ata.o kernel/uhci.o kernel/ehci.o kernel/partition.o kernel/storage.o kernel/extfs.o kernel/ntfs.o kernel/fat32.o kernel/pci.o kernel/gpu.o kernel/wpa2_crypto.o kernel/iwlwifi.o kernel/net.o kernel/initrd.o kernel/video.o kernel/speaker.o kernel/font.o kernel/serial.o kernel/ai_hooks.o kernel/spinlock.o
 
 .PHONY: all test-model test-netcfg test-iwlwifi test-wpa2 clean image-mklm image-gguf image-net image-ext2 image-usb iso qemu qemu-gguf qemu-stories15 qemu-net qemu-nvidia qemu-highmem qemu-ext2 qemu-usb
 
