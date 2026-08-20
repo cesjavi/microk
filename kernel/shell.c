@@ -79,59 +79,72 @@ typedef struct {
 } net_http_get_req_t;
 
 static inline void syscall_print(const char *msg) {
-    asm volatile ("int $0x80" : : "a"(SYS_PRINT), "c"(msg) : "memory");
+    uint32_t _sc = SYS_PRINT;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(msg) : "memory");
 }
 
 static inline void syscall_yield(void) {
-    asm volatile ("int $0x80" : : "a"(SYS_YIELD) : "memory");
+    uint32_t _sc = SYS_YIELD;
+    asm volatile ("int $0x80" : "+a"(_sc) : : "memory");
 }
 
 static inline char syscall_get_char(void) {
     char c = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_GET_CHAR), "c"(&c) : "memory");
+    uint32_t _sc = SYS_GET_CHAR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(&c) : "memory");
     return c;
 }
 
 static inline void syscall_llm_query(const char *prompt, char *response) {
-    asm volatile ("int $0x80" : : "a"(SYS_LLM_QUERY), "c"(prompt), "d"(response) : "memory");
+    uint32_t _sc = SYS_LLM_QUERY;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(prompt), "d"(response) : "memory");
 }
 
 static inline void syscall_put_char(char c) {
-    asm volatile ("int $0x80" : : "a"(SYS_PUT_CHAR), "c"((uint32_t)c) : "memory");
+    uint32_t _sc = SYS_PUT_CHAR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"((uint32_t)c) : "memory");
 }
 
 static inline void syscall_clear(void) {
-    asm volatile ("int $0x80" : : "a"(SYS_CLEAR) : "memory");
+    uint32_t _sc = SYS_CLEAR;
+    asm volatile ("int $0x80" : "+a"(_sc) : : "memory");
 }
 
 static inline void syscall_mem_stats(pmm_stats_t *stats) {
-    asm volatile ("int $0x80" : : "a"(SYS_MEM_STATS), "c"(stats) : "memory");
+    uint32_t _sc = SYS_MEM_STATS;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(stats) : "memory");
 }
 
 static inline void syscall_heap_stats(kheap_stats_t *stats) {
-    asm volatile ("int $0x80" : : "a"(SYS_HEAP_STATS), "c"(stats) : "memory");
+    uint32_t _sc = SYS_HEAP_STATS;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(stats) : "memory");
 }
 
 static inline int syscall_heap_test(void) {
     int result = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_HEAP_TEST), "c"(&result) : "memory");
+    uint32_t _sc = SYS_HEAP_TEST;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(&result) : "memory");
     return result;
 }
 
 static inline void syscall_fat_ls(const char *path) {
-    asm volatile ("int $0x80" : : "a"(SYS_FAT_LS), "c"(path) : "memory");
+    uint32_t _sc = SYS_FAT_LS;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(path) : "memory");
 }
 
 static inline void syscall_fat_cat(const char *path) {
-    asm volatile ("int $0x80" : : "a"(SYS_FAT_CAT), "c"(path) : "memory");
+    uint32_t _sc = SYS_FAT_CAT;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(path) : "memory");
 }
 
 static inline void syscall_ext_ls(void) {
-    asm volatile ("int $0x80" : : "a"(SYS_EXT_LS) : "memory");
+    uint32_t _sc = SYS_EXT_LS;
+    asm volatile ("int $0x80" : "+a"(_sc) : : "memory");
 }
 
 static inline void syscall_ext_cat(const char *path) {
-    asm volatile ("int $0x80" : : "a"(SYS_EXT_CAT), "c"(path) : "memory");
+    uint32_t _sc = SYS_EXT_CAT;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(path) : "memory");
 }
 
 static inline int syscall_llm_load(uint32_t addr, uint32_t size, const char *name) {
@@ -177,7 +190,8 @@ static inline int syscall_fat_is_dir(const char *path) {
 }
 
 static inline void syscall_llm_trace_set(int enabled) {
-    asm volatile ("int $0x80" : : "a"(SYS_LLM_TRACE_SET), "c"((uint32_t)enabled) : "memory");
+    uint32_t _sc = SYS_LLM_TRACE_SET;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"((uint32_t)enabled) : "memory");
 }
 
 static inline int syscall_llm_trace_status(void) {
@@ -187,11 +201,13 @@ static inline int syscall_llm_trace_status(void) {
 }
 
 static inline void syscall_llm_status_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_LLM_STATUS_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_LLM_STATUS_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static inline void syscall_llm_info_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_LLM_INFO_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_LLM_INFO_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static inline int syscall_llm_gguf_selftest(void) {
@@ -202,33 +218,39 @@ static inline int syscall_llm_gguf_selftest(void) {
 
 static inline int syscall_fat_create(const char *path) {
     int result = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_FAT_CREATE), "c"(path), "d"(&result) : "memory");
+    uint32_t _sc = SYS_FAT_CREATE;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(path), "d"(&result) : "memory");
     return result;
 }
 
 static inline void syscall_fat_write(const char *path, const char *data, uint32_t size) {
-    asm volatile ("int $0x80" : : "a"(SYS_FAT_WRITE), "c"(path), "d"(data), "b"(size) : "memory");
+    uint32_t _sc = SYS_FAT_WRITE;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(path), "d"(data), "b"(size) : "memory");
 }
 
 static inline int syscall_fat_delete(const char *path) {
     int result = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_FAT_DELETE), "c"(path), "d"(&result) : "memory");
+    uint32_t _sc = SYS_FAT_DELETE;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(path), "d"(&result) : "memory");
     return result;
 }
 
 static inline int syscall_fat_mkdir(const char *path) {
     int result = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_FAT_MKDIR), "c"(path), "d"(&result) : "memory");
+    uint32_t _sc = SYS_FAT_MKDIR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(path), "d"(&result) : "memory");
     return result;
 }
 
 static inline void syscall_net_status_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_NET_STATUS_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_NET_STATUS_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static inline int syscall_net_config_dhcp(void) {
     int result = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_NET_CONFIG_DHCP), "c"(&result) : "memory");
+    uint32_t _sc = SYS_NET_CONFIG_DHCP;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(&result) : "memory");
     return result;
 }
 
@@ -238,7 +260,8 @@ static inline int syscall_net_config_static(const char *ip, const char *mask, co
     args[0] = ip;
     args[1] = mask;
     args[2] = gw;
-    asm volatile ("int $0x80" : : "a"(SYS_NET_CONFIG_STATIC), "c"(args), "d"(&result), "b"(0) : "memory");
+    uint32_t _sc = SYS_NET_CONFIG_STATIC;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(args), "d"(&result), "b"(0) : "memory");
     return result;
 }
 
@@ -255,31 +278,37 @@ static inline int syscall_ipc_shm_selftest(void) {
 }
 
 static inline void syscall_llm_dump_logits(const char *prompt, char *response) {
-    asm volatile ("int $0x80" : : "a"(SYS_LLM_DUMP_LOGITS), "c"(prompt), "d"(response) : "memory");
+    uint32_t _sc = SYS_LLM_DUMP_LOGITS;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(prompt), "d"(response) : "memory");
 }
 
 static inline uint32_t syscall_mem_region_count(void) {
     uint32_t count = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_MEM_REGION_COUNT), "c"(&count) : "memory");
+    uint32_t _sc = SYS_MEM_REGION_COUNT;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(&count) : "memory");
     return count;
 }
 
 static inline int syscall_mem_region_get(uint32_t index, pmm_memory_region_t *region) {
     int result = 0;
-    asm volatile ("int $0x80" : : "a"(SYS_MEM_REGION_GET), "c"(index), "d"(region), "b"(&result) : "memory");
+    uint32_t _sc = SYS_MEM_REGION_GET;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(index), "d"(region), "b"(&result) : "memory");
     return result;
 }
 
 static inline void syscall_gpu_status_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_GPU_STATUS_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_GPU_STATUS_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static inline void syscall_usb_status_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_USB_STATUS_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_USB_STATUS_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static inline void syscall_usb_msd_test_str(char *buf, int with_write_test) {
-    asm volatile ("int $0x80" : : "a"(SYS_USB_MSD_TEST_STR), "c"(buf), "d"(with_write_test) : "memory");
+    uint32_t _sc = SYS_USB_MSD_TEST_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf), "d"(with_write_test) : "memory");
 }
 
 static inline int syscall_http_get(const char *host, uint16_t port, const char *path, char *out, uint32_t out_size) {
@@ -295,7 +324,8 @@ static inline int syscall_http_get(const char *host, uint16_t port, const char *
 }
 
 static inline void syscall_arp_status_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_ARP_STATUS_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_ARP_STATUS_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static inline int syscall_highmem_test(void) {
@@ -317,11 +347,13 @@ static inline int syscall_llm_net_set(int enabled) {
 }
 
 static inline void syscall_llm_net_status_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_LLM_NET_STATUS_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_LLM_NET_STATUS_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static inline void syscall_net_poll(void) {
-    asm volatile ("int $0x80" : : "a"(SYS_NET_POLL) : "memory");
+    uint32_t _sc = SYS_NET_POLL;
+    asm volatile ("int $0x80" : "+a"(_sc) : : "memory");
 }
 
 static inline int syscall_net_wifi_scan(void) {
@@ -390,7 +422,8 @@ static inline int syscall_rsh_token(const char *token) {
 }
 
 static inline void syscall_rsh_status_str(char *buf) {
-    asm volatile ("int $0x80" : : "a"(SYS_RSH_STATUS_STR), "c"(buf) : "memory");
+    uint32_t _sc = SYS_RSH_STATUS_STR;
+    asm volatile ("int $0x80" : "+a"(_sc) : "c"(buf) : "memory");
 }
 
 static char shell_cwd[64] = "";
