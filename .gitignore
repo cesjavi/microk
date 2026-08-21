@@ -6,6 +6,9 @@
 build/
 bin/
 
+# Firmware blobs are real tracked assets, not build output
+!firmware/**/*.bin
+
 # IDEs
 .vscode/
 .idea/
