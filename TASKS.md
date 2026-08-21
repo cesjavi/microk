@@ -55,7 +55,7 @@
 - [x] ext2 read-only: double/triple indirect blocks.
 - [x] Agregar prueba manual `qemu-ext2` con imagen ext2.
 - [x] ext2 read-only real: validación amplia (ver ROADMAP.md Fase 4). Manejo robusto ext3/ext4 (journal replay, extents) sigue pendiente.
-- [ ] USB storage (UHCI hecho; EHCI: deteccion+bring-up+puertos hecho en `kernel/ehci.c`, enumeracion/BOT pendiente — ver ROADMAP.md Etapa 3).
+- [ ] USB storage (UHCI hecho; EHCI: deteccion+bring-up+puertos+enumeracion hecho en `kernel/ehci.c`, Bulk-Only Transport pendiente — ver ROADMAP.md Etapa 3).
 
 ## Kernel y Estabilidad
  
