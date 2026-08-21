@@ -131,6 +131,10 @@ typedef struct {
     uint8_t bulk_out_ep;
     uint16_t bulk_in_mps;
     uint16_t bulk_out_mps;
+    /* Persistent data toggle per bulk pipe, same reasoning as
+     * kernel/uhci.c's uhci_device_t fields of the same name. */
+    uint8_t bulk_in_toggle;
+    uint8_t bulk_out_toggle;
 } ehci_device_t;
 
 typedef struct {
@@ -436,6 +440,100 @@ static int ehci_control_transfer(uint8_t addr, uint8_t mps,
     return 0;
 }
 
+/* A single qTD's 5 buffer-pointer dwords describe up to 5 consecutive
+ * physical pages: buffer[0]'s low 12 bits are the starting offset within
+ * its page, buffer[1..4] are the page-aligned base addresses of each
+ * following page (EHCI spec 3.5.4) -- the HC advances through them on
+ * its own as the transfer crosses page boundaries. kernel/uhci.c never
+ * needs this (it chunks into one Transfer Descriptor per max-packet
+ * already), but ehci_bulk_transfer hands the caller's buffer straight to
+ * hardware with no scratch copy (same no-copy reasoning UHCI's own
+ * uhci_bulk_transfer comment gives), and that buffer's alignment isn't
+ * under this driver's control -- a 512-byte sector read from an
+ * arbitrary stack address can genuinely straddle a page boundary. */
+static int ehci_qtd_set_buffer(ehci_qtd_t *td, const void *buf, uint32_t len) {
+    uint32_t addr = (uint32_t)(uintptr_t)buf;
+    uint32_t page0 = addr & ~0xFFFu;
+    uint32_t last = addr + (len > 0 ? len - 1 : 0);
+    uint32_t page_count = ((last & ~0xFFFu) - page0) / 0x1000u + 1;
+    if (page_count > 5) {
+        return -1; /* would need a 6th page pointer, which qTDs don't have */
+    }
+    td->buffer[0] = addr;
+    for (uint32_t i = 1; i < page_count; i++) {
+        td->buffer[i] = page0 + i * 0x1000u;
+    }
+    return 0;
+}
+
+/* Runs one bulk transfer of up to `len` bytes directly to/from `buf` -- no
+ * scratch copy, same reasoning as kernel/uhci.c's uhci_bulk_transfer.
+ * Single qTD (see ehci_qtd_set_buffer above for why that's still safe
+ * across page boundaries), so up to ~20KB in one call depending on
+ * buf's starting offset into its first page; callers here never need
+ * more than one sector at a time. *toggle carries the pipe's DATA0/DATA1
+ * state across calls the same way UHCI's does, computed from how many
+ * whole packets this call actually moved (EHCI toggles DATA0/DATA1
+ * between packets within a single qTD on its own -- this driver just
+ * needs to predict where that leaves things for the *next* qTD, since
+ * each call here is its own fresh qTD, not a continuation of the last
+ * one's overlay state). Returns 0 on success (out_len may be less than
+ * len on a short read), -1 on stall/error, -2 on timeout. */
+static int ehci_bulk_transfer(uint8_t addr, uint8_t endpoint, int data_in, uint16_t mps,
+                               void *buf, uint32_t len, uint8_t *toggle, uint32_t *out_len) {
+    if (!ehci.present || !ehci.ctrl) {
+        return -1;
+    }
+    if (mps == 0) {
+        mps = 512; /* high-speed bulk default */
+    }
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (len == 0) {
+        return 0;
+    }
+
+    ehci_qh_t *qh = &ehci.ctrl->head_qh;
+    qh->endpoint_chars = QH_CHAR_HEAD | QH_CHAR_DTC | QH_CHAR_SPEED_HIGH
+        | ((uint32_t)addr) | ((uint32_t)endpoint << QH_CHAR_ENDPT_SHIFT)
+        | ((uint32_t)mps << QH_CHAR_MPL_SHIFT);
+
+    ehci_qtd_t td;
+    memset(&td, 0, sizeof(td));
+    td.next_qtd = EHCI_PTR_TERMINATE;
+    td.alt_next_qtd = EHCI_PTR_TERMINATE;
+    if (ehci_qtd_set_buffer(&td, buf, len) != 0) {
+        return -1;
+    }
+    td.token = QTD_TOK_STATUS_ACTIVE | QTD_TOK_CERR_3
+        | (data_in ? QTD_TOK_PID_IN : QTD_TOK_PID_OUT)
+        | (len << QTD_TOK_BYTES_SHIFT) | (uint32_t)((*toggle & 1) ? QTD_TOK_DT : 0);
+    memcpy((void *)&ehci.ctrl->td[0], &td, sizeof(td));
+    qh->next_qtd = (uint32_t)(uintptr_t)&ehci.ctrl->td[0];
+    qh->alt_next_qtd = EHCI_PTR_TERMINATE;
+    qh->token = 0;
+
+    uint32_t bytes_left = 0;
+    int rc = ehci_wait_overlay(&bytes_left);
+    qh->next_qtd = EHCI_PTR_TERMINATE;
+    qh->token = 0;
+    if (rc != 0) {
+        return rc;
+    }
+
+    uint32_t actual = len - bytes_left;
+    uint32_t packets = (actual + mps - 1) / mps;
+    if (packets == 0) {
+        packets = 1; /* a genuine zero-length packet still consumes the toggle */
+    }
+    *toggle = (uint8_t)((*toggle + packets) & 1);
+    if (out_len) {
+        *out_len = actual;
+    }
+    return 0;
+}
+
 /* Walks a configuration descriptor's variable-length tail looking for the
  * first bulk IN/OUT endpoint pair -- identical logic (and byte layout) to
  * kernel/uhci.c's uhci_parse_config_descriptor, duplicated rather than
@@ -551,8 +649,399 @@ static void ehci_enumerate_port(int port) {
         if (ehci_control_transfer(new_addr, mps0, 0x00, USB_REQ_SET_CONFIGURATION,
                 cfgbuf[5], 0, 0, 0, 0, 0) == 0) {
             dev->configured = 1;
+            dev->bulk_in_toggle = 0;
+            dev->bulk_out_toggle = 0;
         }
     }
+}
+
+/* ---- USB Mass Storage: Bulk-Only Transport + minimal SCSI ----
+ *
+ * Built on top of the bulk pipes enumeration already found above
+ * (ehci_bulk_transfer, dev->bulk_in_ep/out_ep). CBW/CSW framing and the
+ * SCSI command set are byte-for-byte identical to kernel/uhci.c's own
+ * copy of this section -- USB Mass Storage Bulk-Only Transport doesn't
+ * vary by host controller, only the bulk-transfer primitive underneath
+ * it does. Duplicated rather than factored into a shared module for now
+ * (see ROADMAP.md note on this); kept deliberately parallel to UHCI's
+ * naming/shape so a future dedup pass is mechanical. */
+
+static void ehci_put_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t ehci_get_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t ehci_get_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/* Prints a fixed-length SCSI text field (space-padded ASCII, e.g.
+ * INQUIRY's vendor/product strings) trimmed of trailing spaces, with any
+ * non-printable byte shown as '.'. Identical to kernel/uhci.c's copy. */
+static void append_scsi_text(char *out, uint32_t *pos, uint32_t max, const uint8_t *bytes, uint32_t len) {
+    uint32_t end = len;
+    while (end > 0 && bytes[end - 1] == ' ') {
+        end--;
+    }
+    for (uint32_t i = 0; i < end && *pos + 1 < max; i++) {
+        uint8_t c = bytes[i];
+        out[*pos] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+        (*pos)++;
+    }
+    out[*pos] = '\0';
+}
+
+#define USB_BOT_CBW_LEN 31
+#define USB_BOT_CSW_LEN 13
+#define USB_BOT_CBW_SIG 0x43425355u /* "USBC" */
+#define USB_BOT_CSW_SIG 0x53425355u /* "USBS" */
+
+static uint32_t ehci_msd_next_tag = 1;
+
+/* First configured device with both bulk endpoints found -- no hub
+ * support, so at most EHCI_MAX_PORTS devices exist and there's no
+ * enumeration/LUN concept beyond "the one mass-storage device". */
+static ehci_device_t *ehci_msd_device(void) {
+    for (int p = 0; p < ehci.n_ports; p++) {
+        ehci_device_t *dev = &ehci.devices[p];
+        if (dev->valid && dev->configured && dev->bulk_in_ep && dev->bulk_out_ep) {
+            return dev;
+        }
+    }
+    return 0;
+}
+
+/* Runs one Bulk-Only Transport command: CBW (wrapping `cdb`, cdb_len
+ * bytes) out, an optional data stage (`data_len` bytes, direction
+ * `data_in`) through the matching bulk pipe, then the CSW in. Validates
+ * the CSW signature and that its tag echoes the CBW's. Returns 0 on CSW
+ * status "passed" (0x00), -1 on CSW "failed"/"phase error" or a
+ * signature/tag mismatch, -2 on a transfer error/timeout on any of the
+ * three stages. Identical logic to kernel/uhci.c's uhci_msd_command. */
+static int ehci_msd_command(ehci_device_t *dev, const uint8_t *cdb, uint8_t cdb_len,
+                             void *data, uint32_t data_len, int data_in, uint32_t *out_len) {
+    if (!dev || cdb_len == 0 || cdb_len > 16) {
+        return -2;
+    }
+
+    uint32_t tag = ehci_msd_next_tag++;
+
+    uint8_t cbw[USB_BOT_CBW_LEN];
+    memset(cbw, 0, sizeof(cbw));
+    ehci_put_le32(cbw + 0, USB_BOT_CBW_SIG);
+    ehci_put_le32(cbw + 4, tag);
+    ehci_put_le32(cbw + 8, data_len);
+    cbw[12] = (uint8_t)((data_len > 0 && data_in) ? 0x80 : 0x00);
+    cbw[13] = 0; /* LUN 0 -- no hub/multi-LUN support */
+    cbw[14] = cdb_len;
+    memcpy(cbw + 15, cdb, cdb_len);
+
+    if (ehci_bulk_transfer(dev->address, dev->bulk_out_ep, 0, dev->bulk_out_mps,
+            cbw, USB_BOT_CBW_LEN, &dev->bulk_out_toggle, 0) != 0) {
+        return -2;
+    }
+
+    uint32_t transferred = 0;
+    if (data_len > 0) {
+        uint8_t *pipe_toggle = data_in ? &dev->bulk_in_toggle : &dev->bulk_out_toggle;
+        uint8_t pipe_ep = data_in ? dev->bulk_in_ep : dev->bulk_out_ep;
+        uint16_t pipe_mps = data_in ? dev->bulk_in_mps : dev->bulk_out_mps;
+        if (ehci_bulk_transfer(dev->address, pipe_ep, data_in, pipe_mps,
+                data, data_len, pipe_toggle, &transferred) != 0) {
+            return -2;
+        }
+    }
+
+    uint8_t csw[USB_BOT_CSW_LEN];
+    uint32_t csw_len = 0;
+    if (ehci_bulk_transfer(dev->address, dev->bulk_in_ep, 1, dev->bulk_in_mps,
+            csw, USB_BOT_CSW_LEN, &dev->bulk_in_toggle, &csw_len) != 0 || csw_len < USB_BOT_CSW_LEN) {
+        return -2;
+    }
+
+    if (ehci_get_le32(csw + 0) != USB_BOT_CSW_SIG || ehci_get_le32(csw + 4) != tag) {
+        return -1;
+    }
+
+    if (out_len) {
+        *out_len = transferred;
+    }
+    return (csw[12] == 0) ? 0 : -1;
+}
+
+/* SCSI TEST UNIT READY (6-byte CDB, no data stage). */
+static int ehci_msd_test_unit_ready(ehci_device_t *dev) {
+    uint8_t cdb[6];
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x00;
+    return ehci_msd_command(dev, cdb, 6, 0, 0, 0, 0);
+}
+
+/* SCSI INQUIRY (6-byte CDB, data IN). `out_size` is capped to 36 bytes,
+ * the standard INQUIRY data length every SCSI device supports. */
+static int ehci_msd_inquiry(ehci_device_t *dev, uint8_t *out, uint32_t out_size) {
+    uint8_t len = (uint8_t)(out_size < 36 ? out_size : 36);
+    uint8_t cdb[6];
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x12;
+    cdb[4] = len;
+    return ehci_msd_command(dev, cdb, 6, out, len, 1, 0);
+}
+
+/* SCSI READ CAPACITY(10) (10-byte CDB, 8 bytes data IN: last valid LBA
+ * and block size, both big-endian per SCSI convention). */
+static int ehci_msd_read_capacity10(ehci_device_t *dev, uint32_t *out_last_lba, uint32_t *out_block_size) {
+    uint8_t cdb[10];
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x25;
+    uint8_t data[8];
+    uint32_t got = 0;
+    int rc = ehci_msd_command(dev, cdb, 10, data, 8, 1, &got);
+    if (rc != 0) {
+        return rc;
+    }
+    if (got < 8) {
+        return -2;
+    }
+    if (out_last_lba) {
+        *out_last_lba = ehci_get_be32(data + 0);
+    }
+    if (out_block_size) {
+        *out_block_size = ehci_get_be32(data + 4);
+    }
+    return 0;
+}
+
+/* SCSI READ(10): `count` blocks of `block_size` bytes starting at `lba`
+ * into `buf`. */
+static int ehci_msd_read10(ehci_device_t *dev, uint32_t lba, uint16_t count, uint32_t block_size, void *buf) {
+    uint8_t cdb[10];
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x28;
+    cdb[2] = (uint8_t)(lba >> 24);
+    cdb[3] = (uint8_t)(lba >> 16);
+    cdb[4] = (uint8_t)(lba >> 8);
+    cdb[5] = (uint8_t)lba;
+    cdb[7] = (uint8_t)(count >> 8);
+    cdb[8] = (uint8_t)count;
+    return ehci_msd_command(dev, cdb, 10, buf, (uint32_t)count * block_size, 1, 0);
+}
+
+/* SCSI WRITE(10): same layout/caps as ehci_msd_read10, opposite direction. */
+static int ehci_msd_write10(ehci_device_t *dev, uint32_t lba, uint16_t count, uint32_t block_size, const void *buf) {
+    uint8_t cdb[10];
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x2A;
+    cdb[2] = (uint8_t)(lba >> 24);
+    cdb[3] = (uint8_t)(lba >> 16);
+    cdb[4] = (uint8_t)(lba >> 8);
+    cdb[5] = (uint8_t)lba;
+    cdb[7] = (uint8_t)(count >> 8);
+    cdb[8] = (uint8_t)count;
+    return ehci_msd_command(dev, cdb, 10, (void *)buf, (uint32_t)count * block_size, 0, 0);
+}
+
+/* ---- block_device_t integration ----
+ *
+ * Mirrors kernel/ata.c's ata_block_read/write + ata_primary_master shape
+ * exactly (same as kernel/uhci.c's own equivalent), so
+ * partition_scan_mbr/vfs_mount need zero changes to work on a USB stick
+ * behind EHCI. One sector per SCSI command, same read-modify-write
+ * handling for partial-sector I/O as kernel/uhci.c/kernel/ata.c. */
+
+#define EHCI_MSD_MAX_BLOCK_SIZE 4096
+
+static block_device_t ehci_msd_blockdev;
+static int ehci_msd_blockdev_valid = 0;
+
+static uint32_t ehci_msd_block_read(block_device_t *device, uint32_t offset, uint32_t size, uint8_t *buffer) {
+    ehci_device_t *dev = (ehci_device_t *)device->driver_data;
+    if (!dev || !buffer) {
+        return 0;
+    }
+
+    uint32_t block_size = device->block_size;
+    uint8_t sector[EHCI_MSD_MAX_BLOCK_SIZE];
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t absolute = offset + done;
+        uint32_t lba = absolute / block_size;
+        uint32_t sector_offset = absolute % block_size;
+        uint32_t chunk = block_size - sector_offset;
+        if (chunk > size - done) {
+            chunk = size - done;
+        }
+
+        if (lba >= device->block_count) {
+            break;
+        }
+        if (ehci_msd_read10(dev, lba, 1, block_size, sector) != 0) {
+            break;
+        }
+        memcpy(buffer + done, sector + sector_offset, chunk);
+        done += chunk;
+    }
+    return done;
+}
+
+static uint32_t ehci_msd_block_write(block_device_t *device, uint32_t offset, uint32_t size, uint8_t *buffer) {
+    ehci_device_t *dev = (ehci_device_t *)device->driver_data;
+    if (!dev || !buffer) {
+        return 0;
+    }
+
+    uint32_t block_size = device->block_size;
+    uint8_t sector[EHCI_MSD_MAX_BLOCK_SIZE];
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t absolute = offset + done;
+        uint32_t lba = absolute / block_size;
+        uint32_t sector_offset = absolute % block_size;
+        uint32_t chunk = block_size - sector_offset;
+        if (chunk > size - done) {
+            chunk = size - done;
+        }
+
+        if (lba >= device->block_count) {
+            break;
+        }
+        if (chunk < block_size) {
+            if (ehci_msd_read10(dev, lba, 1, block_size, sector) != 0) {
+                break;
+            }
+            memcpy(sector + sector_offset, buffer + done, chunk);
+            if (ehci_msd_write10(dev, lba, 1, block_size, sector) != 0) {
+                break;
+            }
+        } else {
+            if (ehci_msd_write10(dev, lba, 1, block_size, buffer + done) != 0) {
+                break;
+            }
+        }
+        done += chunk;
+    }
+    return done;
+}
+
+int ehci_msd_init(void) {
+    ehci_msd_blockdev_valid = 0;
+
+    ehci_device_t *dev = ehci_msd_device();
+    if (!dev) {
+        return -1;
+    }
+
+    uint32_t last_lba = 0, block_size = 0;
+    if (ehci_msd_read_capacity10(dev, &last_lba, &block_size) != 0) {
+        return -1;
+    }
+    if (block_size == 0 || block_size > EHCI_MSD_MAX_BLOCK_SIZE) {
+        return -1;
+    }
+
+    memset(&ehci_msd_blockdev, 0, sizeof(ehci_msd_blockdev));
+    ehci_msd_blockdev.name = "usbmsd_ehci0";
+    ehci_msd_blockdev.block_size = block_size;
+    ehci_msd_blockdev.block_count = last_lba + 1;
+    ehci_msd_blockdev.driver_data = dev;
+    ehci_msd_blockdev.read = ehci_msd_block_read;
+    ehci_msd_blockdev.write = ehci_msd_block_write;
+    ehci_msd_blockdev_valid = 1;
+    return 0;
+}
+
+block_device_t *ehci_msd_primary(void) {
+    return ehci_msd_blockdev_valid ? &ehci_msd_blockdev : 0;
+}
+
+static char ehci_msd_buf[512];
+
+/* Runs a diagnostic pass over the attached mass-storage device and
+ * formats the result: INQUIRY, TEST UNIT READY, READ CAPACITY(10), then
+ * a READ(10) of LBA 0. All read-only/safe against real hardware.
+ * with_write_test additionally does a WRITE(10)+READ(10) roundtrip at a
+ * scratch LBA -- same caveats as kernel/uhci.c's uhci_msd_test_string. */
+const char *ehci_msd_test_string(int with_write_test) {
+    uint32_t pos = 0;
+    memset(ehci_msd_buf, 0, sizeof(ehci_msd_buf));
+
+    ehci_device_t *dev = ehci_msd_device();
+    if (!dev) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): no configured mass-storage device found.\n");
+        return ehci_msd_buf;
+    }
+
+    uint8_t inq[36];
+    memset(inq, 0, sizeof(inq));
+    if (ehci_msd_inquiry(dev, inq, sizeof(inq)) != 0) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): INQUIRY failed.\n");
+        return ehci_msd_buf;
+    }
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): INQUIRY ok, vendor='");
+    append_scsi_text(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), inq + 8, 8);
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "' product='");
+    append_scsi_text(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), inq + 16, 16);
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "'\n");
+
+    int tur_rc = ehci_msd_test_unit_ready(dev);
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): TEST UNIT READY ");
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), tur_rc == 0 ? "ready\n" : "not ready\n");
+
+    uint32_t last_lba = 0, block_size = 0;
+    if (ehci_msd_read_capacity10(dev, &last_lba, &block_size) != 0) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): READ CAPACITY(10) failed.\n");
+        return ehci_msd_buf;
+    }
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): capacity 0x");
+    append_hex32(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), last_lba + 1);
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), " blocks x 0x");
+    append_hex32(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), block_size);
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), " bytes\n");
+
+    if (block_size != 512) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): block size != 512, skipping READ(10)/WRITE(10) checks.\n");
+        return ehci_msd_buf;
+    }
+
+    uint8_t sector[512];
+    if (ehci_msd_read10(dev, 0, 1, 512, sector) != 0) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): READ(10) LBA 0 failed.\n");
+        return ehci_msd_buf;
+    }
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): READ(10) LBA 0 ok.\n");
+
+    if (!with_write_test) {
+        return ehci_msd_buf;
+    }
+
+    uint8_t original[512];
+    if (ehci_msd_read10(dev, 100, 1, 512, original) != 0) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): WRITE(10) test: READ(10) LBA 100 (baseline) failed.\n");
+        return ehci_msd_buf;
+    }
+    uint8_t pattern[512];
+    memset(pattern, 0xA5, sizeof(pattern));
+    if (ehci_msd_write10(dev, 100, 1, 512, pattern) != 0) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): WRITE(10) LBA 100 failed.\n");
+        return ehci_msd_buf;
+    }
+    uint8_t verify[512];
+    if (ehci_msd_read10(dev, 100, 1, 512, verify) != 0) {
+        append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): WRITE(10) test: readback failed.\n");
+        return ehci_msd_buf;
+    }
+    int match = memcmp(verify, pattern, sizeof(pattern)) == 0;
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), "USB MSD (EHCI): WRITE(10) roundtrip ");
+    append_str(ehci_msd_buf, &pos, sizeof(ehci_msd_buf), match ? "ok\n" : "MISMATCH\n");
+    ehci_msd_write10(dev, 100, 1, 512, original); /* restore, best-effort */
+
+    return ehci_msd_buf;
 }
 
 static int ehci_find_controller(uint8_t *out_bus, uint8_t *out_slot, uint8_t *out_func, uint32_t *out_bar0) {
@@ -816,7 +1305,7 @@ const char *ehci_status_string(void) {
             append_hex_digit(ehci_status_buf, &pos, sizeof(ehci_status_buf), dev->bulk_in_ep);
             append_str(ehci_status_buf, &pos, sizeof(ehci_status_buf), ", bulk OUT ep");
             append_hex_digit(ehci_status_buf, &pos, sizeof(ehci_status_buf), dev->bulk_out_ep);
-            append_str(ehci_status_buf, &pos, sizeof(ehci_status_buf), " (Bulk-Only Transport not implemented yet)\n");
+            append_str(ehci_status_buf, &pos, sizeof(ehci_status_buf), "\n");
         }
     }
 

@@ -10,13 +10,29 @@
 void storage_init() {
     blockdev_init();
 
-    /* USB 2.0 (EHCI) Etapa 0+1: controller detection, BIOS handoff, and
-     * root port reset/enable only -- no enumeration/transfers yet (see
-     * ROADMAP.md, "Etapa 3: Controlador USB moderno minimo"). Independent
-     * of the UHCI driver below: a machine can have either, both (EHCI +
-     * a UHCI/OHCI companion for full/low-speed devices), or neither. */
+    /* USB 2.0 (EHCI): controller detection, BIOS handoff, root port
+     * reset/enable, device enumeration, and Bulk-Only Transport + minimal
+     * SCSI (see ROADMAP.md, "Etapa 3: Controlador USB moderno minimo").
+     * Independent of the UHCI driver below: a machine can have either,
+     * both (EHCI + a UHCI/OHCI companion for full/low-speed devices), or
+     * neither -- non-high-speed devices on an EHCI port get released to
+     * the companion controller during enumeration and picked up there. */
     if (ehci_init() == 0) {
         klog(ehci_status_string());
+        klog(ehci_msd_test_string(0));
+
+        if (ehci_msd_init() == 0) {
+            block_device_t *usb_disk = ehci_msd_primary();
+            if (usb_disk && blockdev_register(usb_disk) == 0) {
+                klog("Storage: USB (EHCI) mass-storage device detected.");
+                int usb_partitions = partition_scan_mbr(usb_disk);
+                if (usb_partitions > 0) {
+                    klog("Storage: MBR/GPT partitions detected on USB (EHCI) device.");
+                } else {
+                    klog("Storage: no MBR/GPT partitions found on USB (EHCI) device.");
+                }
+            }
+        }
     } else {
         klog("USB: no EHCI controller found.\n");
     }
